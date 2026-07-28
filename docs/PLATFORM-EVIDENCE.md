@@ -1,4 +1,4 @@
-# W10A/W10B platform evidence
+# W10A/W10B and shared-toolchain platform evidence
 
 What was actually run, on what, with which pins. Observed results only;
 platforms not covered by the current workflow are named as such.
@@ -84,6 +84,46 @@ with `tools/probed/schannel-windows-{x86-64,aarch64}.edn`. Both architectures
 have the same layouts, constants, status values, and default-credential
 behavior apart from the declared architecture.
 
+### Six-target shared-toolchain promotion
+
+Source revision `af2e0036358974b38c63595477d136c683df2862` passed the
+expanded six-target matrix in
+[run `30400911333`](https://github.com/casselc/http-client/actions/runs/30400911333).
+This was the first use of the shared toolchain in this repository: all six
+exact archive keys reported `Cache not found`, downloaded the immutable
+`chez-ci-10.4.1.1` release assets, verified their caller-pinned SHA-256
+digests, inventories, Chez versions, and machine types, and installed them
+without a source-build fallback.
+
+| target | runtime evidence | cold job time |
+| --- | --- | --- |
+| Linux x86_64 | full 85/206, babashka 7/11, capability 10/56, plaintext 17/55, libz, 9/9 models | 1m14s |
+| Linux aarch64 | same counts, native `aarch64` target | 1m07s |
+| macOS arm64 | same POSIX counts, `:tls true`, `:compression true`, provider-free plaintext | 1m20s |
+| macOS x86_64 | same POSIX counts and capability report | 2m05s |
+| Windows x86_64 | plaintext 17/55, capability 10/47, contracts 10/32, native TLS 2/11 | 2m02s |
+| Windows aarch64 | same counts, native `tarm64nt` and `aarch64` assertions | 3m39s |
+
+Every count had zero failures and zero errors. The four POSIX capability
+reports were `{:plaintext true :tls true :compression true}`. Both Windows
+reports were `{:plaintext true :tls true :compression false}`. Every plaintext
+row reported provider namespaces `[]`; adding provider coverage on the same
+runner did not weaken the provider-free plaintext claim. Both native TLS
+fixtures again reported `failed,served,failed`.
+
+The final workflow pins
+`casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3`.
+That follow-up changes only the shared action's internal cache implementation
+to `actions/cache` 5.1.0 on Node 24. Source revision
+`ec6650cfee0788a203be070cd8ff0480268db654` passed
+[run `30401296906`](https://github.com/casselc/http-client/actions/runs/30401296906)
+with all six exact archive keys reporting `Cache restored from key`, no release
+download, no Chez source build, and no Node 20 warning. It repeated every count
+above. Warm job times were 1m20s (Linux x86_64), 1m16s (Linux aarch64), 1m33s
+(macOS arm64), 1m41s (macOS x86_64), 2m00s (Windows x86_64), and 3m46s
+(Windows aarch64). Runtime tests, rather than toolchain provisioning, now
+dominate those jobs.
+
 ### Linux x86_64 (local, glibc)
 
 | lane | alias | result |
@@ -148,12 +188,15 @@ Reproduction (from WSL, project staged at
   -ExpectedArch 'x86-64' -TestAlias '-M:plaintext-test' -TimeoutSeconds 1200
 ```
 
-## Not yet covered by hosted CI
+## Current hosted coverage boundary
 
-The current workflow has no macOS x86_64 or arm64 row. The portable plaintext
-and capability gates, POSIX compatibility suites, and lower jolt-tcp/jolt-net
-stack are intended to support macOS, but this branch makes no hosted macOS
-claim until those rows execute successfully.
+The current workflow observes source-runtime behavior on Linux x86_64/aarch64,
+macOS arm64/x86_64, and Windows x86_64/aarch64. The four POSIX rows run the
+full compatibility, OpenSSL, libz, capability, plaintext, and proof gates.
+Windows runs the portable plaintext/capability contracts and the focused
+Schannel contracts plus a real TLS loopback fixture. This remains source-mode
+evidence against the pinned fork core: it is not packaged `joltc` or AOT-image
+evidence.
 
 ## Platform boundaries
 
@@ -174,7 +217,6 @@ raw POSIX sockets onto `teensyp.server`; that is a separate change.
 
 ## Remaining platform work
 
-- Add macOS x86_64 and arm64 hosted rows.
 - Windows compression needs a native compression provider behind the
   `:compression` capability.
 - Porting the POSIX test origin onto `teensyp.server` would let the

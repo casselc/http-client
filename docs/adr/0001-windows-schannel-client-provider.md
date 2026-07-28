@@ -5,6 +5,11 @@
 Implemented on the proposal branch. Both Windows x86-64 and ARM64 ABI records
 and default-credential premises were probed natively. Each hosted lane compares
 fresh evidence byte-for-byte with its committed descriptor.
+Final-tip source-runtime run
+[`30401296906`](https://github.com/casselc/http-client/actions/runs/30401296906)
+repeated the secure/insecure/secure loopback gate on both architectures using
+the checksum-pinned shared Chez toolchain. Packaged `joltc` and AOT images
+remain outside this evidence.
 
 ## Context
 

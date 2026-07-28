@@ -174,3 +174,16 @@ ran 10/32 portable contracts and 2/11 native TLS assertions with the exact
 secure/insecure/secure fixture outcome `failed,served,failed`. Both Linux
 architectures retained the full 85/206 OpenSSL suite and checked all nine
 declared proof-model verdicts.
+
+Six-target shared-toolchain run
+[`30400911333`](https://github.com/casselc/http-client/actions/runs/30400911333)
+then added macOS arm64/x86-64 and replaced every repository-local Chez build
+with checksum-pinned `chez-ci-10.4.1.1` archives. All six archive caches started
+empty and all six platform rows passed. Final-tip run
+[`30401296906`](https://github.com/casselc/http-client/actions/runs/30401296906)
+restored the exact six cache keys through the Node 24 cache action and repeated
+the same green gates at `ec6650c`. The four POSIX rows each passed the full
+85/206 OpenSSL suite, 7/11 babashka surface, 10/56 capability suite, 17/55
+provider-free plaintext suite, libz round-trip, and all nine model verdicts.
+Both Windows rows repeated 17/55, 10/47, 10/32, and 2/11 with
+`failed,served,failed`.
