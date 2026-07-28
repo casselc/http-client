@@ -19,7 +19,7 @@ were fetched at exactly these SHAs into empty caches on both platforms below.
 ## Observed runs
 
 Source/runtime mode throughout: interpreted source mode against the pinned core
-(`bin/joltc` on Linux; native Chez 10.4.1 driving `host\chez\cli.ss` on
+(`bin/jolt` on Linux; native Chez 10.4.1 driving `host\chez\cli.ss` on
 Windows, with `JOLT_AOT_CACHE=0`). No packaged/released `joltc` was used.
 
 ### Linux x86_64 (local, glibc)
@@ -29,7 +29,7 @@ Windows, with `JOLT_AOT_CACHE=0`). No packaged/released `joltc` was used.
 | clj-http-lite suites + transport + TLS | `-M:test` | 75 tests, 174 assertions, 0 fail, 0 error |
 | libz round-trip | `-M:zlibtest` | 5 checks, all passed |
 | babashka.http-client surface | `-M:bhctest` | 7 tests, 11 assertions, 0 fail, 0 error |
-| capability seam | `-M:capability` | 8 tests, 46 assertions, 0 fail, 0 error |
+| capability seam | `-M:capability` | 10 tests, 57 assertions, 0 fail, 0 error |
 | plaintext loopback gate | `-M:plaintext-test` | 17 tests, 55 assertions, 0 fail, 0 error |
 
 Capability report: `{:plaintext true :tls true :compression true}`.
@@ -55,7 +55,7 @@ host. Chez Scheme 10.4.1 native (`D:\chez-10.4.1`), pinned core checked out at
 | lane | alias | result |
 | --- | --- | --- |
 | plaintext loopback gate | `-M:plaintext-test` | 17 tests, 55 assertions, 0 fail, 0 error |
-| capability seam | `-M:capability` | 8 tests, 36 assertions, 0 fail, 0 error |
+| capability seam | `-M:capability` | 10 tests, 45 assertions, 0 fail, 0 error |
 
 Capability report: `{:plaintext true :tls false :compression false}`.
 Provider namespaces loaded during the plaintext run: `[]`.
@@ -70,16 +70,17 @@ Two things make this the load-bearing evidence:
 - The capability suite's fail-closed assertions ran against real absence here,
   where on Linux the same assertions run against forced absence.
 
-The assertion-count difference (36 on Windows vs 46 on Linux) is by design: the
+The assertion-count difference (45 on Windows vs 57 on Linux) is by design: the
 "provider present" tests — callable exports and the gzip/deflate round-trip —
 are skipped when a capability is absent. No test failed or was skipped
 silently.
 
-Reproduction (from WSL, project staged at `D:\src\http-client-w10a`):
+Reproduction (from WSL, project staged at
+`D:\src\http-client-w10a-codex`):
 
 ```powershell
-& "D:\src\http-client-w10a\tools\test-windows-source.ps1" `
-  -ProjectPath "D:\src\http-client-w10a" `
+& "D:\src\http-client-w10a-codex\tools\test-windows-source.ps1" `
+  -ProjectPath "D:\src\http-client-w10a-codex" `
   -RuntimePath "D:\src\jolt-core-w9" `
   -ChezExe "D:\chez-10.4.1\bin\scheme.exe" `
   -ExpectedArch 'x86-64' -TestAlias '-M:plaintext-test' -TimeoutSeconds 1200
@@ -159,6 +160,16 @@ No new formal model was added. Lifecycle, deadline and ownership semantics were
 not changed by this slice — the capability seam sits above the transport and
 alters only *which provider* is selected, never how a connection is opened,
 bounded or closed — and the inherited deterministic tests already cover those
-semantics directly. The genuinely new behaviour is capability resolution and
-refusal, which is finite, has no concurrency dimension worth modelling, and is
-covered exhaustively by `capability-test` in both the present and absent cases.
+semantics directly.
+
+Capability initialization does have a concurrency boundary: Jolt's namespace
+loader must not be raced by simultaneous first callers. Each provider now uses
+Jolt's thread-safe `delay`, whose runtime contract serializes evaluation and
+caches the result. A barrier-driven 16-worker regression test forces concurrent
+first use and requires exactly one provider evaluation with every caller
+observing the same complete result.
+Because the runtime primitive supplies that exactly-once publication contract,
+a separate custom capability state machine or SMT model would duplicate the
+primitive rather than strengthen this layer's evidence. Present/absent
+selection and the end-to-end clj-http-lite decompression refusal remain covered
+by `capability-test`.

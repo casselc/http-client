@@ -11,7 +11,8 @@
   load. Two properties make that safe:
 
     - the provider namespaces (jolt.http.tls, jolt.http.zlib) are required
-      lazily here, so a graph that never speaks https or gzip never loads them;
+      lazily here, so a graph that never speaks https or handles compressed
+      content never loads them;
     - jolt.ffi resolves a `defcfn` binding when it is *called*, not when the
       namespace loads, so requiring a provider whose shared object is absent
       does not abort — which is precisely why a load alone proves nothing and
@@ -20,7 +21,12 @@
   A capability that cannot be provided fails closed: callers get a structured
   ::unsupported-provider error naming the capability, the target, and the
   libraries that would have supplied it. It is never silently degraded, and
-  content is never reported as decoded when no decoder ran."
+  content is never reported as decoded when no decoder ran.
+
+  Jolt's dependency loader does attempt every optional native candidate before
+  loading project namespaces. The laziness here therefore applies to provider
+  namespaces, probes, and use; it does not claim that an already-present shared
+  object was not mapped at process startup."
   (:require [clojure.string :as str]))
 
 ;; A capability is its provider namespace, a probe that performs one real call
@@ -47,12 +53,6 @@
                   :gunzip  'jolt.http.zlib/gunzip
                   :deflate 'jolt.http.zlib/zlib-deflate
                   :inflate 'jolt.http.zlib/zlib-inflate}}})
-
-;; capability -> {:provider {...}} | {:failure exception}. Resolution is
-;; attempted once; a platform does not grow a libssl mid-process, and retrying
-;; a failed native load per request would turn one missing library into an
-;; unbounded cost on the hot path.
-(def ^:private resolved (atom {}))
 
 (defn- unsupported
   [capability failure]
@@ -96,21 +96,24 @@
       (catch :default failure
         {:failure failure}))))
 
+(defn- resolution-delay [capability]
+  (delay (resolve-capability capability)))
+
+;; capability -> thread-safe delay of {:provider {...}} | {:failure exception}.
+;; `require` is not safe to race through Jolt's namespace loader. Each delay
+;; serializes the first use, publishes only the complete result, and retains it
+;; thereafter. The atom exists only so tests can install and then restore a
+;; controlled delay; production never mutates it.
+(def ^:private resolved
+  (atom {:tls (resolution-delay :tls)
+         :compression (resolution-delay :compression)}))
+
 (defn- entry [capability]
   (when-not (contains? capabilities capability)
     (throw (ex-info (str "unknown jolt.http capability " capability)
                     {:jolt.http/kind :unknown-capability
                      :jolt.http/capability capability})))
-  (or (get @resolved capability)
-      ;; Losing this race only means resolve-capability ran twice; `require` is
-      ;; idempotent and the probe has no side effects, so the retained entry is
-      ;; the one every caller sees.
-      (get (swap! resolved
-                  (fn [current]
-                    (if (contains? current capability)
-                      current
-                      (assoc current capability (resolve-capability capability)))))
-           capability)))
+  (force (get @resolved capability)))
 
 (defn available?
   "True when `capability` (:tls or :compression) has a working native provider.
@@ -147,8 +150,8 @@
   (= :unsupported-provider (:jolt.http/kind (ex-data exception))))
 
 (defn report
-  "Capability snapshot for diagnostics and test evidence. Names the target and
-  which capabilities resolved; never exposes native handles."
+  "Resolve both capabilities and return a diagnostic report. Names the target
+  and which providers initialized successfully; never exposes native handles."
   []
   {:target (jolt.host/target)
    :plaintext true

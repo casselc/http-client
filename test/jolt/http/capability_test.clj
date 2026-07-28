@@ -8,7 +8,8 @@
   structured unsupported-provider error rather than a silent downgrade. The
   absent case is also forced explicitly, so the fail-closed path is covered on
   a machine that happens to have both libraries installed."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clj-http.lite.client :as client]
+            [clojure.test :refer [deftest is testing]]
             [jolt.http.capability :as capability]
             [jolt.http.platform :as platform]))
 
@@ -48,6 +49,39 @@
                (seq (capability/invoke :compression :inflate
                                        (capability/invoke :compression :deflate payload)))))))))
 
+(deftest concurrent-first-use-publishes-one-complete-provider
+  ;; Jolt's namespace loader has no per-namespace load lock. A first-use cache
+  ;; implemented by doing `require` inside swap! lets racing callers observe a
+  ;; partially loaded provider and retain a false failure. The capability delay
+  ;; is the serialization boundary: every worker sees the same complete result.
+  (let [cache @#'capability/resolved
+        prior (get @cache :compression)
+        calls (atom 0)
+        fresh (delay
+                (swap! calls inc)
+                (@#'capability/resolve-capability :compression))
+        gate (promise)]
+    (try
+      (swap! cache assoc :compression fresh)
+      (let [workers (doall
+                      (repeatedly 16
+                        #(future
+                           @gate
+                           (capability/available? :compression))))]
+        (deliver gate true)
+        (let [results (mapv deref workers)
+              resolved (force fresh)]
+          (is (= 16 (count results)))
+          (is (apply = results))
+          (is (= 1 @calls))
+          (is (= (contains? resolved :provider) (first results)))
+          (is (= 1 (count (select-keys resolved [:provider :failure]))))
+          (when-let [provider (:provider resolved)]
+            (is (seq provider))
+            (is (every? ifn? (vals provider))))))
+      (finally
+        (swap! cache assoc :compression prior)))))
+
 ;; --- fail-closed ------------------------------------------------------------
 ;; Forced unavailability. This is the behaviour a platform without OpenSSL or
 ;; zlib gets, exercised where those libraries do exist, so the refusal path is
@@ -56,14 +90,15 @@
 (defn- with-capability-unavailable
   "Run `body` with `capability` resolution forced to fail, then restore."
   [capability body]
-  (let [resolved @#'capability/resolved
+  (let [cache @#'capability/resolved
+        prior (get @cache capability)
         failure (ex-info "forced absence for the fail-closed test"
                          {:jolt.http/forced true})]
     (try
-      (swap! resolved assoc capability {:failure failure})
+      (swap! cache assoc capability (delay {:failure failure}))
       (body)
       (finally
-        (swap! resolved dissoc capability)))))
+        (swap! cache assoc capability prior)))))
 
 (deftest an-absent-capability-fails-closed-with-a-structured-error
   (doseq [capability [:tls :compression]]
@@ -105,8 +140,7 @@
         (is (capability/unsupported-provider-error? refused))))))
 
 (deftest decompression-is-refused-rather-than-faked-when-compression-is-absent
-  ;; The response body stays encoded and Content-Encoding stays on the response;
-  ;; what must never happen is undecoded bytes being handed back as decoded.
+  ;; What must never happen is undecoded bytes being handed back as decoded.
   (with-capability-unavailable :compression
     (fn []
       (doseq [construct [#(java.util.zip.GZIPInputStream.
@@ -119,6 +153,26 @@
           (is (some? refused))
           (is (capability/unsupported-provider-error? refused))
           (is (= :compression (:jolt.http/capability (ex-data refused)))))))))
+
+(deftest clj-http-middleware-refuses-an-encoded-response-without-a-provider
+  ;; Exercise clj-http-lite's actual wrap-decompression edge, not only the host
+  ;; zip constructors it eventually calls. Failure aborts the request; no
+  ;; response is returned claiming that these bytes were decoded.
+  (with-capability-unavailable :compression
+    (fn []
+      (let [seen-request (atom nil)
+            wrapped (client/wrap-decompression
+                      (fn [request]
+                        (reset! seen-request request)
+                        {:status 200
+                         :headers {"content-encoding" "gzip"}
+                         :body (byte-array [1 2 3])}))
+            refused (caught #(wrapped {:headers {}}))]
+        (is (= "gzip, deflate"
+               (get-in @seen-request [:headers "Accept-Encoding"])))
+        (is (some? refused))
+        (is (capability/unsupported-provider-error? refused))
+        (is (= :compression (:jolt.http/capability (ex-data refused))))))))
 
 (defn -main [& _]
   (let [result (clojure.test/run-tests 'jolt.http.capability-test)]

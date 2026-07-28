@@ -417,8 +417,7 @@
   ;; as before, and without it construction raises the structured
   ;; unsupported-provider error. clj-http-lite's wrap-decompression only reaches
   ;; here after a response arrived carrying Content-Encoding, so a refusal
-  ;; leaves that header — and the still-encoded body — explicit to the caller
-  ;; instead of handing back bytes that were never decoded.
+  ;; aborts the request rather than handing back bytes that were never decoded.
   (doseq [nm ["GZIPInputStream" "java.util.zip.GZIPInputStream"]]
     (__register-class-ctor! nm (fn [src & _]
                                  (make-bais (capability/invoke :compression :gunzip (->bytes src))))))

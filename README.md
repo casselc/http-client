@@ -38,8 +38,11 @@ declarations and never expose a descriptor here.
 ## Platforms and capabilities
 
 Plaintext HTTP is the base graph and requires no OpenSSL and no zlib. TLS and
-content-encoding are **optional capabilities**, selected on first use through
-`jolt.http.capability` and never loaded to serve a plain `http://` request.
+content-encoding are **optional capabilities** whose provider namespaces and
+probes are selected on first use through `jolt.http.capability`. Jolt still
+attempts optional native-library candidates while resolving the dependency
+graph; a library already installed on the host may therefore be mapped before
+its provider namespace is used.
 
 | | plaintext HTTP | https (OpenSSL TLS) | gzip/deflate (libz) |
 | --- | --- | --- | --- |
@@ -58,9 +61,10 @@ or constructing one of the `java.util.zip` streams, raises an `ex-info` carrying
 ```
 
 An https request is never silently downgraded to plaintext, and a body is never
-returned as decoded when no decoder ran — the response keeps its
-`Content-Encoding` and the caller gets the refusal. `jolt.http.capability/report`
-describes what resolved on the running platform.
+returned as decoded when no decoder ran. An unsupported encoded response aborts
+with the structured refusal; no response map is returned.
+`jolt.http.capability/report` actively resolves both providers and reports the
+result for the running platform.
 
 Windows TLS would need a Schannel provider and Windows compression a native
 compression provider; neither is in this slice. Note that jolt-crypto's Windows
@@ -132,7 +136,8 @@ redirects, connect refusal, read deadlines, a silent origin, a server that
 closes without responding, and the absence of any native descriptor at the
 transport boundary. It **fails** if any of `jolt.http.tls`, `jolt.http.zlib` or
 `jolt.crypto` is loaded during the run, which is the direct form of the claim
-that plaintext needs no TLS or compression provider.
+that an unencoded plaintext exchange does not initialize a TLS or compression
+provider namespace.
 
 Set `JOLT_EXPECTED_ARCH` (`x86-64` or `aarch64`) to make the lane refuse to run
 under architecture emulation.
