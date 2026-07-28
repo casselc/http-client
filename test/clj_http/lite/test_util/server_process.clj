@@ -20,7 +20,11 @@
                               {:path path}))))
         plain (srv/start-plain http-port)
         tls   (srv/start-tls https-port cert key)]
-    (Thread/sleep 300)
+    ;; No readiness sleep: start-plain / start-tls call bind(2) and listen(2)
+    ;; synchronously and only then spawn the accept loop, so the socket is
+    ;; already listening when they return, and the kernel backlog holds any
+    ;; connection arriving before accept(2) is first entered. A sleep here
+    ;; would be guessing at a race that cannot happen.
     {:http-port http-port :https-port https-port :plain plain :tls tls}))
 
 (defn kill [{:keys [plain tls]}]
