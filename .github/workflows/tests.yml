@@ -251,24 +251,12 @@ jobs:
             throw "expected an ARM64 runner, got '${{ runner.arch }}'"
           }
 
-      # The first W10B run captures the native ARM64 descriptor as an artifact.
-      # Once reviewed and committed, this switches to byte-for-byte comparison
-      # just like x86-64; until then it is evidence collection, not a table gate.
-      - name: Capture native ARM64 Schannel ABI and client-credential evidence
+      - name: Probe native ARM64 Schannel ABI and default client credentials
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\tools\probe-schannel.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
-            -ExpectedArch 'aarch64' `
-            -NoCompare `
-            -OutputPath "$env:RUNNER_TEMP\schannel-windows-aarch64.edn"
-
-      - name: Upload native ARM64 Schannel descriptor
-        uses: actions/upload-artifact@v4
-        with:
-          name: schannel-windows-aarch64
-          path: ${{ runner.temp }}\schannel-windows-aarch64.edn
-          if-no-files-found: error
+            -ExpectedArch 'aarch64'
 
       - name: Checkout official Chez Scheme v10.4.1
         uses: actions/checkout@v4

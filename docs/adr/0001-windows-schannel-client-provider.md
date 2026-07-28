@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted for implementation. The x86-64 ABI and default-credential premise are
-probed natively; the first ARM64 workflow run is deliberately evidence
-collection and must be reviewed before ARM64 becomes a descriptor gate.
+Accepted for implementation. Both Windows x86-64 and ARM64 ABI records and
+default-credential premises were probed natively. Each hosted lane now compares
+fresh evidence byte-for-byte with its committed descriptor.
 
 ## Context
 
@@ -83,10 +83,12 @@ recorded:
 - signed `SECURITY_STATUS` values, including
   `SEC_E_INCOMPLETE_MESSAGE = -2146893032`.
 
-The committed record is
-`tools/probed/schannel-windows-x86-64.edn`. The workflow refuses descriptor
-drift. ARM64 remains evidence collection until its native artifact has been
-reviewed and committed.
+The committed records are
+`tools/probed/schannel-windows-x86-64.edn` and
+`tools/probed/schannel-windows-aarch64.edn`. The latter was captured by a
+native ARM64 host in workflow run `30397904843`; its layouts, constants, status
+values, and runtime credential results match x86-64 byte-for-byte apart from
+the declared architecture. Both workflow lanes now refuse descriptor drift.
 
 ## State-machine obligations
 

@@ -1,0 +1,45 @@
+{:os :windows
+ :arch :aarch64
+ :pointer-bits 64
+ :layout {
+  :sec-handle {:size 16 :lower 0 :upper 8}
+  :sec-buffer {:size 16 :length 0 :type 4 :pointer 8}
+  :sec-buffer-desc {:size 16 :version 0 :count 4 :buffers 8}
+  :stream-sizes {:size 20 :header 0 :trailer 4 :maximum-message 8 :buffers 12 :block-size 16}
+ }
+ :const {
+  :credential-outbound 2
+  :native-data-representation 16
+  :attribute-stream-sizes 4
+  :buffer-empty 0
+  :buffer-data 1
+  :buffer-token 2
+  :buffer-extra 5
+  :buffer-stream-trailer 6
+  :buffer-stream-header 7
+  :request-sequence-detect 8
+  :request-replay-detect 4
+  :request-confidentiality 16
+  :request-allocate-memory 256
+  :request-extended-error 16384
+  :request-stream 32768
+  :request-manual-validation 524288
+  :shutdown-token 1
+ }
+ :status {
+  :ok 0
+  :continue-needed 590610
+  :complete-needed 590611
+  :complete-and-continue 590612
+  :context-expired 590615
+  :incomplete-credentials 590624
+  :incomplete-message -2146893032
+  :renegotiate 590625
+ }
+ :runtime {
+  :default-outbound-credentials true
+  :automatic-validation-initial-token true
+  :manual-validation-initial-token true
+  :automatic-token-nonempty true
+  :manual-token-nonempty true
+ }}
