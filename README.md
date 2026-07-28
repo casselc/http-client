@@ -33,9 +33,45 @@ map.
 | `java.net.http.HttpClient` (JDK 11+ client) | construction, getters, and synchronous/live-settled sends for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by babashka.http-client and cognitect aws-api's java backend |
 
 `jolt-tcp` and its transitive `jolt-net` dependency own platform socket
-declarations and never expose a descriptor here. This project declares libz;
-`jolt-crypto` declares OpenSSL. Jolt reconciles and loads those native libraries
-before the corresponding namespaces are required.
+declarations and never expose a descriptor here.
+
+## Platforms and capabilities
+
+Plaintext HTTP is the base graph and requires no OpenSSL and no zlib. TLS and
+content-encoding are **optional capabilities**, selected on first use through
+`jolt.http.capability` and never loaded to serve a plain `http://` request.
+
+| | plaintext HTTP | https (OpenSSL TLS) | gzip/deflate (libz) |
+| --- | --- | --- | --- |
+| Linux x86_64 / aarch64 | yes | yes | yes |
+| macOS | yes | yes | yes |
+| Windows x86_64 / aarch64 | yes | not yet — see below | not yet — see below |
+
+Where a capability has no provider it **fails closed**. Requesting `https://`,
+or constructing one of the `java.util.zip` streams, raises an `ex-info` carrying
+
+```clojure
+{:jolt.http/kind :unsupported-provider
+ :jolt.http/capability :tls            ; or :compression
+ :jolt.http/libraries ["libssl" "libcrypto"]
+ :jolt.http/target {:os :windows :arch :x86-64 ...}}
+```
+
+An https request is never silently downgraded to plaintext, and a body is never
+returned as decoded when no decoder ran — the response keeps its
+`Content-Encoding` and the caller gets the refusal. `jolt.http.capability/report`
+describes what resolved on the running platform.
+
+Windows TLS would need a Schannel provider and Windows compression a native
+compression provider; neither is in this slice. Note that jolt-crypto's Windows
+CNG backend supplies AES/HMAC/digest/RNG only — it is **not** a TLS
+implementation and does not substitute for Schannel.
+
+Native declarations: this project declares `libz` and `libssl` as `:optional`
+capability libraries; `jolt-crypto` declares `libcrypto`/`bcrypt`, also
+optional. Nothing in the plaintext path requires a shared object to be present,
+which is what lets dependency resolution and a real request both succeed on
+native Windows.
 
 Positive connect/read timeouts retain their millisecond budgets.
 `HttpURLConnection`'s unset/zero connect timeout remains unbounded, and
@@ -48,10 +84,14 @@ overrun the configured budget while DNS is blocked.
 
 ## Requirements
 
-- System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
+- Nothing native for plaintext HTTP.
+- System OpenSSL (`libssl`/`libcrypto`) for https, and `libz` for
+  gzip/deflate — optional, and only where those capabilities are used.
 - A `jolt` build with the library-shim host hooks (`__register-class-methods!` /
   `__register-instance-check!`) and the FFI byte-buffer / charset support this
-  library relies on.
+  library relies on. The pinned `jolt-net` needs host/FFI primitives a released
+  `joltc` does not carry, so build against the core revision named in
+  `.github/workflows/tests.yml` (`JOLT_CORE_SHA`).
 
 ## Tests
 
@@ -70,3 +110,29 @@ The main suite includes deterministic transport/deadline and TLS error-ordering
 tests in addition to clj-http-lite's integration suite. Separate
 `joltc -M:bhctest` and `joltc -M:zlibtest` aliases cover babashka.http-client and
 libz.
+
+`-M:test`, `-M:zlibtest` and `-M:bhctest` are **POSIX lanes**: their in-process
+origin (`jolt.http.test-server`) opens its listener with raw POSIX
+`socket`/`bind`/`listen`/`accept`, and the TLS suite needs OpenSSL.
+
+Two further aliases are portable and run identically on Linux, macOS and native
+Windows:
+
+```
+joltc -M:plaintext-test   # real loopback HTTP over jolt-tcp, no TLS, no zlib
+joltc -M:capability       # provider seam: resolved providers and fail-closed refusals
+```
+
+`-M:plaintext-test` serves its requests from `jolt.http.portable-server`, an
+origin built on `teensyp.server` from jolt-tcp rather than raw POSIX sockets, so
+the same suite witnesses the same behaviour on every platform. It covers GET /
+POST / PUT, body conservation in both directions, request headers, all three
+response framings (fixed `Content-Length`, chunked, and connection-close),
+redirects, connect refusal, read deadlines, a silent origin, a server that
+closes without responding, and the absence of any native descriptor at the
+transport boundary. It **fails** if any of `jolt.http.tls`, `jolt.http.zlib` or
+`jolt.crypto` is loaded during the run, which is the direct form of the claim
+that plaintext needs no TLS or compression provider.
+
+Set `JOLT_EXPECTED_ARCH` (`x86-64` or `aarch64`) to make the lane refuse to run
+under architecture emulation.

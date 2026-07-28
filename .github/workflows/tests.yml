@@ -1,20 +1,325 @@
 name: tests
-on: [push, pull_request]
+
+on: [push, pull_request, workflow_dispatch]
+
+env:
+  # One reviewed fork revision for every source-mode lane. The pinned jolt-net
+  # (reached through jolt-tcp) needs host/FFI primitives a released joltc does
+  # not carry, so every lane below builds against this core rather than a
+  # published artifact. Keep it centralized so no platform can silently
+  # validate against a different core.
+  JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # ---------------------------------------------------------------------------
+  # POSIX: the full surface, including the capabilities that are POSIX-only
+  # today. This is the lane that keeps OpenSSL TLS and libz compression honest.
+  # It is deliberately NOT the lane backing the cross-platform plaintext claim.
+  # ---------------------------------------------------------------------------
+  posix:
+    name: POSIX suite (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            arch: x86-64
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@v4
-      - name: Install joltc
+
+      # The source-build recipe used by Jolt's core workflow. Do not substitute
+      # a distro Chez package: Jolt's build paths need the source installation's
+      # kernel development files as well as `scheme` itself.
+      - name: Install source-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev \
+            libncurses-dev uuid-dev libssl-dev
+
+      - name: Cache Chez Scheme
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: ~/chez
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
+
+      - name: Build official Chez Scheme v10.4.1 from source
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y liblz4-1 zlib1g libtinfo6 libssl3
-          url=$(curl -fsSL https://api.github.com/repos/jolt-lang/jolt/releases/latest \
-                | jq -r '.assets[] | select(.name | test("x86_64-linux\\.tar\\.gz$")) | .browser_download_url')
-          mkdir -p "$HOME/.jolt"
-          curl -fsSL "$url" | tar xz -C "$HOME/.jolt" --strip-components=1
-          chmod +x "$HOME/.jolt/joltc"
-          echo "$HOME/.jolt" >> "$GITHUB_PATH"
-      - name: Test
-        run: JOLT_PWD="$PWD" joltc -M:test
+          git clone --depth 1 --branch v10.4.1 \
+            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
+          cd "$RUNNER_TEMP/chez-src"
+          ./configure --installprefix="$HOME/chez" --threads --disable-x11
+          make -j"$(nproc)"
+          make install
+
+      - name: Provide and assert official Chez v10.4.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$HOME/chez/bin"
+          test -x "$bindir/scheme"
+          printf '#!/bin/sh\nexec %s "$@"\n' "$bindir/scheme" > "$bindir/chez"
+          chmod +x "$bindir/chez"
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$bindir/chez" --version | tee /tmp/chez-version
+          grep -Fq '10.4.1' /tmp/chez-version
+
+      - name: Checkout pinned Jolt core
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: ${{ env.JOLT_CORE_SHA }}
+          submodules: recursive
+          path: jolt
+
+      # clj-http-lite's own client/links/integration suites, plus the transport
+      # boundary and OpenSSL TLS tests. TLS and gzip are exercised here.
+      - name: clj-http-lite compatibility suite (TLS + compression)
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:test
+
+      - name: libz round-trip
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:zlibtest
+
+      - name: babashka.http-client compatibility surface
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:bhctest
+
+      - name: Capability seam (present and forced-absent providers)
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:capability
+
+      # The same gate the Windows lanes run, so a divergence between platforms
+      # shows up as one suite disagreeing rather than as two different suites.
+      - name: Plaintext loopback gate
+        shell: bash
+        env:
+          JOLT_EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:plaintext-test
+
+  # ---------------------------------------------------------------------------
+  # Native Windows: the claim this slice exists to make. Plaintext HTTP through
+  # the unchanged clj-http-lite API, over jolt-tcp, against a real loopback
+  # origin, on a platform carrying neither OpenSSL nor zlib. The gate fails if
+  # any provider namespace is loaded during the run, so it cannot quietly become
+  # a POSIX-shaped test that happens to pass.
+  #
+  # Source-runtime evidence only: official native Chez 10.4.1, AOT disabled, no
+  # packaged joltc.
+  # ---------------------------------------------------------------------------
+  windows-plaintext:
+    name: Plaintext loopback (Windows x86_64)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/aot-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 source-build toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-zlib
+
+      - name: Cache Chez Scheme
+        id: cache-chez-windows
+        uses: actions/cache@v4
+        with:
+          path: chez-install
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-mingw64-v1
+
+      - name: Build official Chez Scheme v10.4.1 from source
+        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v10.4.1 \
+            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
+          cd "$RUNNER_TEMP/chez-src"
+          ./configure --threads
+          make -j"$(nproc)"
+          inst="$GITHUB_WORKSPACE/chez-install"
+          mkdir -p "$inst/bin" "$inst/csv"
+          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
+          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
+          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
+          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
+
+      - name: Provide and assert official Chez v10.4.1
+        run: |
+          set -euo pipefail
+          bindir="$GITHUB_WORKSPACE/chez-install/bin"
+          test -x "$bindir/scheme.exe"
+          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
+          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
+          chmod +x "$bindir/chez" "$bindir/cc"
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
+          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
+          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
+
+      - name: Checkout pinned Jolt core
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: ${{ env.JOLT_CORE_SHA }}
+          submodules: recursive
+          path: jolt
+
+      - name: Plaintext loopback gate (real sockets, no OpenSSL, no zlib)
+        shell: powershell
+        env:
+          JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ExpectedArch 'x86-64' `
+            -TestAlias '-M:plaintext-test' `
+            -TimeoutSeconds 900
+
+      # Proves the refusal, not merely the absence: on a platform with no TLS
+      # and no zlib the capability suite is what shows https and gzip failing
+      # closed with the structured error rather than degrading.
+      - name: Capability seam
+        shell: powershell
+        env:
+          JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ExpectedArch 'x86-64' `
+            -TestAlias '-M:capability' `
+            -TimeoutSeconds 600
+
+  # ---------------------------------------------------------------------------
+  # Windows ARM64 runs the same gates on a native ARM64 Chez. The
+  # JOLT_EXPECTED_ARCH check inside the test main makes an emulated x86-64
+  # process fail before any assertion can pass, so a green run here is aarch64
+  # evidence rather than emulation.
+  # ---------------------------------------------------------------------------
+  windows-arm64-plaintext:
+    name: Plaintext loopback (Windows aarch64)
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 60
+    env:
+      JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the runner is ARM64
+        shell: pwsh
+        run: |
+          Write-Host "runner.arch      = ${{ runner.arch }}"
+          Write-Host "PROCESSOR_ARCH   = $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "OS architecture  = $((Get-CimInstance Win32_OperatingSystem).OSArchitecture)"
+          if ('${{ runner.arch }}' -ne 'ARM64') {
+            throw "expected an ARM64 runner, got '${{ runner.arch }}'"
+          }
+
+      - name: Checkout official Chez Scheme v10.4.1
+        uses: actions/checkout@v4
+        with:
+          repository: cisco/ChezScheme
+          ref: v10.4.1
+          submodules: recursive
+          persist-credentials: false
+          path: chez-arm64
+
+      - name: Cache native ARM64 Chez Scheme
+        id: cache-chez-arm64
+        uses: actions/cache@v4
+        with:
+          path: chez-arm64/tarm64nt
+          key: chez-windows-tarm64nt-v10.4.1-msvc-v1
+
+      - name: Build native ARM64 Chez Scheme from source
+        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          cd /d "%GITHUB_WORKSPACE%\chez-arm64"
+          call build.bat tarm64nt /only || exit /b 1
+
+      - name: Checkout pinned Jolt core
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: ${{ env.JOLT_CORE_SHA }}
+          submodules: recursive
+          path: jolt
+
+      - name: Assert native ARM64 Chez v10.4.1
+        shell: pwsh
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE `
+            'chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe'
+          if (-not (Test-Path $scheme)) {
+            throw "native ARM64 Chez executable not found: $scheme"
+          }
+          $version = (& $scheme --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "scheme.exe --version exited $LASTEXITCODE"
+          }
+          Write-Host "chez version: $version"
+          if (-not $version.Contains('10.4.1')) {
+            throw "expected Chez Scheme 10.4.1, got: $version"
+          }
+          $probe = Join-Path $env:RUNNER_TEMP 'machine-type.ss'
+          Set-Content -Path $probe -Value '(display (machine-type))(newline)'
+          $machine = (& $scheme --script $probe | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "scheme.exe --script exited $LASTEXITCODE"
+          }
+          Write-Host "machine-type: $machine"
+          if ($machine -ne 'tarm64nt') {
+            throw "expected a native tarm64nt Chez, got '$machine'"
+          }
+
+      - name: Plaintext loopback gate (real sockets, no OpenSSL, no zlib)
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ExpectedArch 'aarch64' `
+            -TestAlias '-M:plaintext-test' `
+            -TimeoutSeconds 900
+
+      - name: Capability seam
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ExpectedArch 'aarch64' `
+            -TestAlias '-M:capability' `
+            -TimeoutSeconds 600
