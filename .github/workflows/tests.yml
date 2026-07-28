@@ -2,6 +2,9 @@ name: tests
 
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: read
+
 env:
   # One reviewed fork revision for every source-mode lane. The pinned jolt-net
   # (reached through jolt-tcp) needs host/FFI primitives a released joltc does
@@ -9,6 +12,7 @@ env:
   # published artifact. Keep it centralized so no platform can silently
   # validate against a different core.
   JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+  CHEZ_TOOLCHAIN_RELEASE: chez-ci-10.4.1.1
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -27,58 +31,69 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-24.04
             arch: x86-64
+            chez-target: linux-x86_64
+            chez-sha256: 16476cd98fb5cb2e2c0285e88fcd6d57ade9392ca8d7cf603ca38432b4118526
           - name: Linux aarch64
             runner: ubuntu-24.04-arm
             arch: aarch64
+            chez-target: linux-aarch64
+            chez-sha256: b5b2306d3d6468b5fc7d5836721b09c704c7750f887a6232f1aeeb567d55f5d9
+          - name: macOS arm64
+            runner: macos-15
+            arch: aarch64
+            chez-target: macos-arm64
+            chez-sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
+          - name: macOS x86_64
+            runner: macos-15-intel
+            arch: x86-64
+            chez-target: macos-x86_64
+            chez-sha256: e4577ad71b1f1e1062c361fa612af60d75378e64dc2869d8c8eefd3d7efdbc62
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      # The source-build recipe used by Jolt's core workflow. Do not substitute
-      # a distro Chez package: Jolt's build paths need the source installation's
-      # kernel development files as well as `scheme` itself.
-      - name: Install source-build dependencies
+      # The immutable archives contain Chez and its source-runtime headers.
+      # These are only the libraries exercised by this repository plus the
+      # archive extractor; Chez itself is never built from source here.
+      - name: Install runtime dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev \
-            libncurses-dev uuid-dev libssl-dev z3
+          sudo apt-get install -y libssl-dev z3 zstd
 
-      - name: Cache Chez Scheme
-        id: cache-chez
-        uses: actions/cache@v4
+      - name: Install runtime dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3 z3 zstd
+
+      - name: Set up the shared Chez CI toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
         with:
-          path: ~/chez
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
+          target: ${{ matrix.chez-target }}
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: ${{ matrix.chez-sha256 }}
+          capabilities: source-runtime
 
-      - name: Build official Chez Scheme v10.4.1 from source
-        if: steps.cache-chez.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch v10.4.1 \
-            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
-          cd "$RUNNER_TEMP/chez-src"
-          ./configure --installprefix="$HOME/chez" --threads --disable-x11
-          make -j"$(nproc)"
-          make install
-
+      # The action verifies the pinned digest, packaged inventory, version, and
+      # target machine type. There is no source-build fallback: corrupted,
+      # republished, or wrongly targeted archives fail the lane closed.
       - name: Provide and assert official Chez v10.4.1
         shell: bash
         run: |
           set -euo pipefail
-          bindir="$HOME/chez/bin"
-          test -x "$bindir/scheme"
-          printf '#!/bin/sh\nexec %s "$@"\n' "$bindir/scheme" > "$bindir/chez"
-          chmod +x "$bindir/chez"
-          echo "$bindir" >> "$GITHUB_PATH"
-          "$bindir/chez" --version | tee /tmp/chez-version
-          grep -Fq '10.4.1' /tmp/chez-version
+          test -x "$JOLT_CHEZ"
+          "$JOLT_CHEZ" --version > "$RUNNER_TEMP/chez-version" 2>&1
+          cat "$RUNNER_TEMP/chez-version"
+          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
 
       - name: Checkout pinned Jolt core
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
+          persist-credentials: false
           path: jolt
 
       # clj-http-lite's own client/links/integration suites, plus the transport
@@ -130,13 +145,12 @@ jobs:
     name: Plaintext loopback (Windows x86_64)
     runs-on: windows-2022
     timeout-minutes: 45
-    defaults:
-      run:
-        shell: msys2 {0}
     env:
       JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/aot-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Probe native Schannel ABI and default client credentials
         shell: powershell
@@ -145,71 +159,46 @@ jobs:
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -ExpectedArch 'x86-64'
 
-      - name: Set up MSYS2 source-build toolchain
-        uses: msys2/setup-msys2@v2
+      - name: Set up the shared Chez CI toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
         with:
-          msystem: MINGW64
-          update: false
-          path-type: inherit
-          install: >-
-            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-lz4
-            mingw-w64-x86_64-zlib
-
-      - name: Cache Chez Scheme
-        id: cache-chez-windows
-        uses: actions/cache@v4
-        with:
-          path: chez-install
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-mingw64-v1
-
-      - name: Build official Chez Scheme v10.4.1 from source
-        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch v10.4.1 \
-            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
-          cd "$RUNNER_TEMP/chez-src"
-          ./configure --threads
-          make -j"$(nproc)"
-          inst="$GITHUB_WORKSPACE/chez-install"
-          mkdir -p "$inst/bin" "$inst/csv"
-          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
-          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
-          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
-          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
+          target: windows-x86_64
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: 360c60496eea2f8aab0e557eb77e9e18b315bb9181938158ae57655aa541b7f8
+          capabilities: source-runtime
 
       - name: Provide and assert official Chez v10.4.1
+        shell: powershell
+        env:
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
-          set -euo pipefail
-          bindir="$GITHUB_WORKSPACE/chez-install/bin"
-          test -x "$bindir/scheme.exe"
-          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
-          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
-          chmod +x "$bindir/chez" "$bindir/cc"
-          echo "$bindir" >> "$GITHUB_PATH"
-          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
-          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
-          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
+          $version = (& $env:CHEZ_EXECUTABLE --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host $version
+          if (-not $version.Contains('10.4.1')) {
+            throw "expected Chez Scheme 10.4.1, got: $version"
+          }
 
       - name: Checkout pinned Jolt core
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
+          persist-credentials: false
           path: jolt
 
       - name: Plaintext loopback gate (real sockets, no TLS or zlib provider)
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'x86-64' `
             -TestAlias '-M:plaintext-test' `
             -TimeoutSeconds 900
@@ -218,11 +207,12 @@ jobs:
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'x86-64' `
             -TestAlias '-M:capability' `
             -TimeoutSeconds 600
@@ -231,11 +221,12 @@ jobs:
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-schannel.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'x86-64' `
             -TimeoutSeconds 600
 
@@ -252,7 +243,9 @@ jobs:
     env:
       JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Assert the runner is ARM64
         shell: pwsh
@@ -271,42 +264,30 @@ jobs:
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -ExpectedArch 'aarch64'
 
-      - name: Checkout official Chez Scheme v10.4.1
-        uses: actions/checkout@v4
+      - name: Set up the shared Chez CI toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
         with:
-          repository: cisco/ChezScheme
-          ref: v10.4.1
-          submodules: recursive
-          persist-credentials: false
-          path: chez-arm64
-
-      - name: Cache native ARM64 Chez Scheme
-        id: cache-chez-arm64
-        uses: actions/cache@v4
-        with:
-          path: chez-arm64/tarm64nt
-          key: chez-windows-tarm64nt-v10.4.1-msvc-v1
-
-      - name: Build native ARM64 Chez Scheme from source
-        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
-        shell: cmd
-        run: |
-          cd /d "%GITHUB_WORKSPACE%\chez-arm64"
-          call build.bat tarm64nt /only || exit /b 1
+          target: windows-arm64
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: 9bc28462823a1447de6d849e129758a6317cc9deafb8e87414817e7244f149c8
+          capabilities: source-runtime
 
       - name: Checkout pinned Jolt core
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
+          persist-credentials: false
           path: jolt
 
       - name: Assert native ARM64 Chez v10.4.1
         shell: pwsh
+        env:
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
-          $scheme = Join-Path $env:GITHUB_WORKSPACE `
-            'chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe'
+          $scheme = $env:CHEZ_EXECUTABLE
           if (-not (Test-Path $scheme)) {
             throw "native ARM64 Chez executable not found: $scheme"
           }
@@ -331,32 +312,38 @@ jobs:
 
       - name: Plaintext loopback gate (real sockets, no TLS or zlib provider)
         shell: pwsh
+        env:
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'aarch64' `
             -TestAlias '-M:plaintext-test' `
             -TimeoutSeconds 900
 
       - name: Capability seam
         shell: pwsh
+        env:
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'aarch64' `
             -TestAlias '-M:capability' `
             -TimeoutSeconds 600
 
       - name: Native Schannel TLS gate
         shell: pwsh
+        env:
+          CHEZ_EXECUTABLE: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-schannel.ps1" `
             -ProjectPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ChezExe "$env:CHEZ_EXECUTABLE" `
             -ExpectedArch 'aarch64' `
             -TimeoutSeconds 600
