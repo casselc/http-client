@@ -240,6 +240,21 @@
         nil))
     st))
 
+(defn available?
+  "True when libssl is actually callable in this process.
+
+  jolt.ffi binds a defcfn when it is called, not when this namespace loads, so
+  loading proves nothing about the shared object. TLS_client_method returns a
+  static method table, allocates nothing and frees nothing, which makes it the
+  cheapest honest question to ask. jolt.http.capability probes through here
+  before reporting TLS as available, so an https request on a platform without
+  OpenSSL is refused with a structured capability error instead of failing
+  somewhere inside the handshake."
+  []
+  (try
+    (not (ffi/null? (c-TLS-client-method)))
+    (catch :default _ false)))
+
 (defn tls-connect
   "Open a TLS client connection to host:port. insecure? disables peer
   verification (self-signed/expired certs accepted). Connect and read deadline

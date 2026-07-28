@@ -6,14 +6,19 @@
   host-shim hooks (__register-class-ctor! / __register-class-methods! /
   __register-instance-check!) — like jolt-lang/router does for reitit.
 
-  https is handled by jolt.http.tls (OpenSSL); gzip/deflate by jolt.http.zlib
-  (libz). Shim objects are host tagged-tables; their fields are read/written with
+  This namespace is the plaintext graph, and it stays that way: the only
+  transport it requires is jolt.http.net over jolt-tcp. https (jolt.http.tls,
+  OpenSSL) and gzip/deflate (jolt.http.zlib, libz) are optional capabilities
+  reached through jolt.http.capability, which loads and probes a provider on
+  first use and fails closed with a structured unsupported-provider error where
+  none exists. Nothing here loads libssl, libcrypto or libz to serve a plain
+  http:// request, which is what lets this library start on native Windows.
+
+  Shim objects are host tagged-tables; their fields are read/written with
   jolt.host/ref-get / ref-put!."
   (:require [clojure.string :as str]
-            [jolt.crypto]                ;; java.security.SecureRandom (real, RAND_bytes)
-            [jolt.http.net :as net]
-            [jolt.http.zlib :as zlib]
-            [jolt.http.tls :as tls]))
+            [jolt.http.capability :as capability]
+            [jolt.http.net :as net]))
 
 ;; --- helpers ---------------------------------------------------------------
 (defn- tt [tag] (jolt.host/tagged-table tag))
@@ -122,15 +127,21 @@
     (if (and (number? p) (>= p 0)) p (if (= (tget url :protocol) "https") 443 80))))
 
 ;; --- stream abstraction (plain jolt-tcp transport vs TLS stream table) ------
+;; Dispatch positively on the plaintext transport rather than negatively on
+;; "not a table": the plaintext case is the one that must never be able to fall
+;; through to a TLS-shaped lookup on a platform where TLS does not exist.
 (defn- s-write [stream data opts]
-  (if (table? stream)
-    ((tget stream :write) stream data opts)
-    (net/send-bytes stream data opts)))
+  (if (net/transport? stream)
+    (net/send-bytes stream data opts)
+    ((tget stream :write) stream data opts)))
 (defn- s-read [stream opts]
-  (if (table? stream)
-    ((tget stream :read) stream opts)
-    (net/recv-bytes stream opts)))
-(defn- s-close [stream] (if (table? stream) ((tget stream :close)) (net/close stream)))
+  (if (net/transport? stream)
+    (net/recv-bytes stream opts)
+    ((tget stream :read) stream opts)))
+(defn- s-close [stream]
+  (if (net/transport? stream)
+    (net/close stream)
+    ((tget stream :close))))
 
 ;; --- HTTP/1.1 client -------------------------------------------------------
 (defn- connect-stream
@@ -145,7 +156,10 @@
                (some? deadline-nanos)
                (assoc :deadline-nanos deadline-nanos))]
     (if https?
-      (tls/tls-connect host port insecure? opts)
+      ;; The only https entry point. Where OpenSSL is absent this raises the
+      ;; structured unsupported-provider error rather than quietly downgrading
+      ;; the request to plaintext.
+      (capability/invoke :tls :connect host port insecure? opts)
       (net/connect (str host) port opts))))
 
 (defn- recv-all [stream opts]
@@ -398,13 +412,22 @@
      "reset" (fn [self] (tput! self :acc []) nil)
      "close" (fn [self & _] nil)})
 
-  ;; java.util.zip streams (eager: (de)compress whole payloads)
+  ;; java.util.zip streams (eager: (de)compress whole payloads). Each one is a
+  ;; compression-capability entry point: with libz present these behave exactly
+  ;; as before, and without it construction raises the structured
+  ;; unsupported-provider error. clj-http-lite's wrap-decompression only reaches
+  ;; here after a response arrived carrying Content-Encoding, so a refusal
+  ;; leaves that header — and the still-encoded body — explicit to the caller
+  ;; instead of handing back bytes that were never decoded.
   (doseq [nm ["GZIPInputStream" "java.util.zip.GZIPInputStream"]]
-    (__register-class-ctor! nm (fn [src & _] (make-bais (zlib/gunzip (->bytes src))))))
+    (__register-class-ctor! nm (fn [src & _]
+                                 (make-bais (capability/invoke :compression :gunzip (->bytes src))))))
   (doseq [nm ["InflaterInputStream" "java.util.zip.InflaterInputStream"]]
-    (__register-class-ctor! nm (fn [src & _] (make-bais (zlib/zlib-inflate (->bytes src))))))
+    (__register-class-ctor! nm (fn [src & _]
+                                 (make-bais (capability/invoke :compression :inflate (->bytes src))))))
   (doseq [nm ["DeflaterInputStream" "java.util.zip.DeflaterInputStream"]]
-    (__register-class-ctor! nm (fn [src & _] (make-bais (zlib/zlib-deflate (->bytes src))))))
+    (__register-class-ctor! nm (fn [src & _]
+                                 (make-bais (capability/invoke :compression :deflate (->bytes src))))))
   (doseq [nm ["GZIPOutputStream" "java.util.zip.GZIPOutputStream"]]
     (__register-class-ctor! nm (fn [target & _]
                                  (let [t (tt :jolt/gzip-out)]
@@ -424,7 +447,7 @@
      "finish" (fn [self & _] nil)
      "close" (fn [self & _]
                (let [target (tget self :target)
-                     gz (zlib/gzip (byte-array (tget self :acc)))]
+                     gz (capability/invoke :compression :gzip (byte-array (tget self :acc)))]
                  (.write target gz))   ;; append the gzipped payload to the target baos
                nil)})
 
@@ -502,9 +525,21 @@
      "setHostnameVerifier" (fn [self v] (tput! self :hostname-verifier v) nil)
      "setSSLSocketFactory" (fn [self f] (tput! self :ssl-factory f) (tput! self :insecure true) nil)})
 
-  ;; javax.net.ssl / java.security stubs for clj-http-lite's trust-all-ssl!
+  ;; javax.net.ssl / java.security stubs for clj-http-lite's trust-all-ssl!.
+  ;;
+  ;; SSLContext/getInstance is the first TLS-shaped call clj-http-lite makes on
+  ;; the insecure path, and it is evaluated before the (SecureRandom.) argument
+  ;; to the .init that follows it. Resolving the TLS capability here therefore
+  ;; does two things at exactly the right moment: it loads jolt.crypto, which
+  ;; registers the real RAND_bytes-backed SecureRandom ctor that .init is about
+  ;; to construct, and it fails closed here — before any connection is
+  ;; attempted — when the platform has no TLS provider at all. Asking for a
+  ;; trust-all SSL context is asking for TLS, so refusing it is correct rather
+  ;; than merely convenient.
   (doseq [nm ["SSLContext" "javax.net.ssl.SSLContext"]]
-    (__register-class-statics! nm {"getInstance" (fn [& _] (tt :jolt/ssl-context))}))
+    (__register-class-statics! nm {"getInstance" (fn [& _]
+                                                   (capability/provider :tls)
+                                                   (tt :jolt/ssl-context))}))
   (__register-class-methods! :jolt/ssl-context
     {"init" (fn [self & _] self)
      "getSocketFactory" (fn [self] (tt :jolt/ssl-socket-factory))})
@@ -618,7 +653,10 @@
      "version"    (fn [self] (or (tget self :version) (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_1_1"))))
      "headers"    (fn [self] (doto (tt :jolt.http/headers) (tput! :pairs (tget self :resp-headers))))})
 
-  ;; java.security.SecureRandom comes from jolt-crypto (real RAND_bytes), required above.
+  ;; java.security.SecureRandom is registered by jolt.crypto (real RAND_bytes),
+  ;; which jolt.http.capability loads as part of the TLS capability rather than
+  ;; eagerly here: its provider selection is eager and would otherwise make
+  ;; libcrypto a load-time requirement of plaintext HTTP.
   ;; TrustManager used as a bare value: (into-array TrustManager [...]).
   (__register-class-ctor! "TrustManager" (fn [& _] nil))
 

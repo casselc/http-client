@@ -5,29 +5,53 @@
  ;; needs (HttpURLConnection / URL / java.util.zip / javax.net.ssl) as Jolt host
  ;; shims, plus TCP through jolt-tcp, TLS through OpenSSL memory BIOs, and gzip
  ;; through libz.
- ;; clj-http-lite straight from git; jolt-lang/jolt-crypto carries the OpenSSL
- ;; (libssl/libcrypto) declarations + the java.security.SecureRandom shim TLS
- ;; needs — so this library and the ring adapter don't each redeclare them
- ;; (jolt.deps reconciles to one load).
+ ;; clj-http-lite straight from git. jolt-tcp brings the portable socket stack
+ ;; (jolt-tcp -> jolt-net), whose only native declarations are the process image
+ ;; and an :optional ws2_32; jolt-crypto contributes libcrypto/bcrypt, both
+ ;; :optional, and deliberately does NOT own libssl. That leaves the plaintext
+ ;; graph free of any required shared object, which is what lets it start on
+ ;; native Windows.
  :deps {org.clj-commons/clj-http-lite
         {:git/url "https://github.com/clj-commons/clj-http-lite"
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
         io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "0c3e085f43b90b346be9843e43448c890f8b701d"}
-        jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
+         :git/sha "911cf783d56e988adb2b8f716b6636fae5454e52"}
+        io.github.casselc/jolt-crypto
+        {:git/url "https://github.com/casselc/jolt-crypto.git"
+         :git/sha "c0b8237e74e4f17d2675b57bab32d4aebd92812f"}}
 
- ;; jolt-tcp owns the transitive platform socket declarations. libssl/libcrypto
- ;; come from jolt-crypto; this project declares only libz directly.
+ ;; Capability libraries, not requirements. Both are :optional so a missing
+ ;; libssl or libz is a runtime capability gap reported by jolt.http.capability
+ ;; as a structured unsupported-provider error — never a load-time abort of the
+ ;; plaintext graph. libssl is declared here because jolt-crypto owns libcrypto
+ ;; only; TLS consumers declare libssl themselves.
  :jolt/native [{:name "z"
+                :optional true
                 :darwin ["libz.dylib" "/usr/lib/libz.dylib"]
-                :linux  ["libz.so.1" "libz.so"]}]
+                :linux  ["libz.so.1" "libz.so"]}
+               {:name "ssl"
+                :optional true
+                :darwin ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib"
+                         "/opt/homebrew/lib/libssl.dylib"
+                         "/usr/local/opt/openssl@3/lib/libssl.dylib"
+                         "/usr/lib/libssl.dylib" "libssl.dylib"]
+                :linux  ["libssl.so.3" "libssl.so.1.1" "libssl.so"]}]
 
  ;; Tests run clj-http-lite's own client/links/integration suites under Jolt, with
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "jolt.http.test-runner"]}
+           ;; The cross-platform plaintext gate. It declares no :extra-deps and
+           ;; loads no TLS or compression namespace, so the coverage it reports
+           ;; cannot quietly become POSIX coverage: if anything dragged libssl
+           ;; or libz back into the plaintext graph, this lane is what stops
+           ;; starting on a machine that has neither.
+           :plaintext-test {:extra-paths ["test"]
+                            :main-opts ["-m" "jolt.http.plaintext-test"]}
+           ;; Reports which optional capabilities resolved on this platform.
+           :capability {:extra-paths ["test"]
+                        :main-opts ["-m" "jolt.http.capability-test"]}
            ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
            :zlibtest {:extra-paths ["test"]
                       :main-opts ["-m" "jolt.http.zlib-test"]}

@@ -89,6 +89,19 @@
         (byte-array (mapcat seq chunks)))
       (finally (ffi/free strm) (ffi/free src-buf) (ffi/free out-buf)))))
 
+(defn available?
+  "True when libz is actually callable in this process.
+
+  jolt.ffi binds a defcfn when it is called, not when this namespace loads, so
+  loading proves nothing about the shared object. zlibVersion takes no
+  arguments, allocates nothing and cannot fail on a healthy library, which
+  makes it the cheapest honest question to ask. jolt.http.capability probes
+  through here before reporting compression as available."
+  []
+  (try
+    (not (ffi/null? (c-zlib-version)))
+    (catch :default _ false)))
+
 (defn gzip         [src] (deflate-bytes src 31))
 (defn gunzip       [src] (inflate-bytes src 47))
 (defn zlib-deflate [src] (deflate-bytes src 15))
