@@ -68,7 +68,7 @@ jobs:
 
       - name: Set up the shared Chez CI toolchain
         id: chez
-        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
         with:
           target: ${{ matrix.chez-target }}
           release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
@@ -161,7 +161,7 @@ jobs:
 
       - name: Set up the shared Chez CI toolchain
         id: chez
-        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
         with:
           target: windows-x86_64
           release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
@@ -266,7 +266,7 @@ jobs:
 
       - name: Set up the shared Chez CI toolchain
         id: chez
-        uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
         with:
           target: windows-arm64
           release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
