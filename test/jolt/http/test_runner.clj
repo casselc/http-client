@@ -10,6 +10,8 @@
             [clojure.test :as t]
             [clj-http.lite.links-test]
             [clj-http.lite.client-test]
+            [jolt.http.net-test]
+            [jolt.http.tls-test]
             [clj-http.lite.integration-test]))
 
 (defn -main [& _]

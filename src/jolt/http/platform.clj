@@ -1,6 +1,6 @@
 (ns jolt.http.platform
   "Platform support for clj-http-lite on Jolt: a hand-rolled HTTP/1.1 client over
-  jolt.http.net (BSD sockets via jolt.ffi), exposed as the java.net.URL /
+  the opaque jolt-tcp client via jolt.http.net, exposed as the java.net.URL /
   HttpURLConnection surface clj-http-lite drives, plus the java.io byte streams
   and java.util.zip / SSL pieces it touches. Registers everything through Jolt's
   host-shim hooks (__register-class-ctor! / __register-class-methods! /
@@ -20,6 +20,18 @@
 (defn- tget [t k] (jolt.host/ref-get t k))
 (defn- tput! [t k v] (jolt.host/ref-put! t k v))
 (defn- table? [x] (jolt.host/table? x))
+(def ^:private nanos-per-ms 1000000)
+
+(defn- monotonic-now []
+  (jolt.host/monotonic-nanos))
+
+(defn- ensure-request-deadline! [opts]
+  (when-let [deadline (:deadline-nanos opts)]
+    (when (>= (monotonic-now) deadline)
+      (throw (ex-info
+               "java.net.http request deadline expired"
+               {:jolt.http/kind :timed-out
+                :jolt.http/deadline-nanos deadline})))))
 
 ;; A typed throwable carrying a JVM class name, so (class e) / catch / thrown?
 ;; match by class AND .getMessage/ex-message return the message.
@@ -109,24 +121,41 @@
   (let [p (tget url :port)]
     (if (and (number? p) (>= p 0)) p (if (= (tget url :protocol) "https") 443 80))))
 
-;; --- stream abstraction (plain socket fd vs TLS stream table) --------------
-(defn- s-write [stream data] (if (table? stream) ((tget stream :write) stream data) (net/send-bytes stream data)))
-(defn- s-read  [stream timeout] (if (table? stream) ((tget stream :read) stream timeout) (net/recv-bytes stream)))
+;; --- stream abstraction (plain jolt-tcp transport vs TLS stream table) ------
+(defn- s-write [stream data opts]
+  (if (table? stream)
+    ((tget stream :write) stream data opts)
+    (net/send-bytes stream data opts)))
+(defn- s-read [stream opts]
+  (if (table? stream)
+    ((tget stream :read) stream opts)
+    (net/recv-bytes stream opts)))
 (defn- s-close [stream] (if (table? stream) ((tget stream :close)) (net/close stream)))
 
 ;; --- HTTP/1.1 client -------------------------------------------------------
-(defn- connect-stream [host port https? insecure? read-timeout]
-  (if https?
-    (tls/tls-connect host port insecure?)
-    (let [fd (net/connect (str host) port)]
-      (when (and read-timeout (pos? read-timeout)) (net/set-read-timeout! fd read-timeout))
-      fd)))
+(defn- connect-stream
+  [host port https? insecure? connect-timeout read-timeout deadline-nanos]
+  (let [opts (cond-> {:connect-timeout-ms
+                      (when (and connect-timeout (pos? connect-timeout))
+                        connect-timeout)}
 
-(defn- recv-all [stream]
+               (and read-timeout (pos? read-timeout))
+               (assoc :read-timeout-ms read-timeout)
+
+               (some? deadline-nanos)
+               (assoc :deadline-nanos deadline-nanos))]
+    (if https?
+      (tls/tls-connect host port insecure? opts)
+      (net/connect (str host) port opts))))
+
+(defn- recv-all [stream opts]
   (loop [chunks []]
-    (if-let [b (s-read stream nil)]
+    (ensure-request-deadline! opts)
+    (if-let [b (s-read stream opts)]
       (recur (conj chunks b))
-      (byte-array (mapcat seq chunks)))))
+      (do
+        (ensure-request-deadline! opts)
+        (byte-array (mapcat seq chunks))))))
 
 (defn- header-ci [pairs name]
   (let [low (str/lower-case name)]
@@ -211,10 +240,15 @@
     (let [https? (= "https" (tget url :protocol))
           body (when (and (tget conn :do-output) (tget conn :out-buffer)) (tget conn :out-buffer))
           stream (connect-stream (tget url :host) (effective-port url) https?
-                                 (tget conn :insecure) (tget conn :read-timeout))
+                                 (tget conn :insecure)
+                                 (tget conn :connect-timeout)
+                                 (tget conn :read-timeout)
+                                 nil)
           resp (try
-                 (s-write stream (build-request method url (tget conn :req-headers) body))
-                 (parse-response (recv-all stream))
+                 (s-write stream
+                          (build-request method url (tget conn :req-headers) body)
+                          {})
+                 (parse-response (recv-all stream {}))
                  (finally (try (s-close stream) (catch Throwable _ nil))))
           loc (header-ci (:header-pairs resp) "location")]
       (if (and (tget conn :follow-redirects)
@@ -233,31 +267,81 @@
 ;; Perform a java.net.http request synchronously over the same socket/TLS layer
 ;; clj-http-lite uses, returning a :jolt.http/response. This is what wires the
 ;; java.net.http shim's send/sendAsync to a real request.
-(defn- net-http-send [request handler]
-  (let [url     (parse-url (str (tget request :uri)))
+(defn- duration-ms [duration]
+  (when duration
+    (if (number? duration)
+      duration
+      (.toMillis duration))))
+
+(defn- deadline-after-ms [timeout-ms]
+  (when (and timeout-ms (pos? timeout-ms))
+    (+ (monotonic-now) (* timeout-ms nanos-per-ms))))
+
+(defn- timeout-error? [exception]
+  (let [data (ex-data exception)
+        cause (ex-cause exception)]
+    (or (= :timed-out (:jolt.http/kind data))
+        (= :timed-out (:teensyp.client/kind data))
+        (= :timed-out (:jolt.net/kind data))
+        (and cause
+             (not (identical? cause exception))
+             (timeout-error? cause)))))
+
+(defn- net-http-send [http-client request handler]
+  (let [request-timeout (duration-ms (tget request :timeout))
+        request-deadline (deadline-after-ms request-timeout)
+        operation-opts (if request-deadline
+                         {:deadline-nanos request-deadline}
+                         {})
+        url     (parse-url (str (tget request :uri)))
         method  (or (tget request :method) "GET")
         headers (or (tget request :headers) [])
         body    (when-let [bp (tget request :body)] (tget bp :bytes))
         https?  (= "https" (tget url :protocol))
-        stream  (connect-stream (tget url :host) (effective-port url) https? false 30000)
-        resp    (try
-                  (s-write stream (build-request method url headers body))
-                  (parse-response (recv-all stream))
-                  (finally (try (s-close stream) (catch Throwable _ nil))))
-        ;; BodyHandlers.ofString hands the body back as a String; ofByteArray (the
-        ;; aws backend's default) as the raw byte[]; ofInputStream (babashka's) as a
-        ;; ByteArrayInputStream over those bytes.
-        body-bytes (:body resp)
-        out-body (cond
-                   (= handler :jolt.http/handler-string) (String. ^bytes body-bytes "UTF-8")
-                   (= handler :jolt.http/handler-inputstream) (make-bais body-bytes)
-                   :else body-bytes)]
-    (doto (tt :jolt.http/response)
-      (tput! :status (:status resp))
-      (tput! :body out-body)
-      (tput! :uri (tget request :uri))
-      (tput! :version (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_1_1")))
-      (tput! :resp-headers (:header-pairs resp)))))
+        connect-timeout (duration-ms (tget http-client :connect-timeout))]
+    (try
+      (let [stream
+            (connect-stream (tget url :host) (effective-port url) https?
+                            false connect-timeout nil request-deadline)
+            resp
+            (try
+              (ensure-request-deadline! operation-opts)
+              (s-write stream
+                       (build-request method url headers body)
+                       operation-opts)
+              (parse-response (recv-all stream operation-opts))
+              (finally (try (s-close stream) (catch Throwable _ nil))))
+            ;; BodyHandlers.ofString hands the body back as a String; ofByteArray
+            ;; (the aws backend's default) as the raw byte[]; ofInputStream
+            ;; (babashka's) as a ByteArrayInputStream over those bytes.
+            body-bytes (:body resp)
+            out-body
+            (cond
+              (= handler :jolt.http/handler-string)
+              (String. ^bytes body-bytes "UTF-8")
+
+              (= handler :jolt.http/handler-inputstream)
+              (make-bais body-bytes)
+
+              :else body-bytes)]
+        (doto (tt :jolt.http/response)
+          (tput! :status (:status resp))
+          (tput! :body out-body)
+          (tput! :uri (tget request :uri))
+          (tput! :version
+                 (doto (tt :jolt.http/version-enum)
+                   (tput! :name "HTTP_1_1")))
+          (tput! :resp-headers (:header-pairs resp))))
+      (catch :default exception
+        (if (and request-deadline
+                 (>= (monotonic-now) request-deadline)
+                 (timeout-error? exception))
+          (throw
+            (jolt.host/throwable
+              "java.net.http.HttpTimeoutException"
+              "request timed out"
+              exception))
+          (throw exception))))))
 
 ;; A settled CompletableFuture: the request ran synchronously, so the future
 ;; already holds a value or an error. thenApply/exceptionally apply immediately.
@@ -426,8 +510,8 @@
      "getSocketFactory" (fn [self] (tt :jolt/ssl-socket-factory))})
   ;; --- java.net.http (JDK 11+ HttpClient) -----------------------------------
   ;; Construction + getters for the cognitect aws-api java backend (and any lib on
-  ;; the modern client). The conformance tests build clients/requests and read them
-  ;; back; live sends are not covered here (sendAsync needs CompletableFuture).
+  ;; the modern client). Live sends use the same opaque TCP/TLS transport as the
+  ;; URLConnection surface; sendAsync returns an already-settled future.
   (doseq [nm ["HttpClient$Redirect" "java.net.http.HttpClient$Redirect"]]
     (__register-class-statics! nm {"NEVER" :jolt.http.redirect/NEVER
                                    "ALWAYS" :jolt.http.redirect/ALWAYS
@@ -460,9 +544,9 @@
      ;; the same request and hands back an already-settled future (thenApply /
      ;; exceptionally apply at once) — enough for the cognitect aws-api flow, which
      ;; does (.sendAsync client req handler) then .thenApply/.exceptionally.
-     "send"            (fn [self req handler] (net-http-send req handler))
+     "send"            (fn [self req handler] (net-http-send self req handler))
      "sendAsync"       (fn [self req handler]
-                         (try (settled-future (net-http-send req handler) nil)
+                         (try (settled-future (net-http-send self req handler) nil)
                               (catch Throwable e (settled-future nil e))))})
   (__register-class-methods! :jolt.http/future
     {"thenApply"     (fn [self f] (if (tget self :error) self

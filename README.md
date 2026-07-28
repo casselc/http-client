@@ -26,14 +26,25 @@ map.
 
 | clj-http-lite uses | Jolt shim |
 | --- | --- |
-| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over BSD sockets via `jolt.ffi` (`jolt.http.net` / `jolt.http.platform`) |
+| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over the opaque `teensyp.client` API from `jolt-tcp` (`jolt.http.net` / `jolt.http.platform`) |
 | `java.io.ByteArrayInput/OutputStream` | byte-stream tagged-tables wired into `io/copy` / `slurp` |
 | `java.util.zip` (gzip/deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
-| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`) |
-| `java.net.http.HttpClient` (JDK 11+ client) | construction + getters for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by cognitect aws-api's java backend. Live sends not yet wired (no `CompletableFuture`). |
+| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the opaque jolt-tcp transport (`jolt.http.tls`) |
+| `java.net.http.HttpClient` (JDK 11+ client) | construction, getters, and synchronous/live-settled sends for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by babashka.http-client and cognitect aws-api's java backend |
 
-The native libraries (libc sockets, libz, OpenSSL) are declared in `deps.edn`
-under `:jolt/native`; jolt loads them before the namespaces are required.
+`jolt-tcp` and its transitive `jolt-net` dependency own platform socket
+declarations and never expose a descriptor here. This project declares libz;
+`jolt-crypto` declares OpenSSL. Jolt reconciles and loads those native libraries
+before the corresponding namespaces are required.
+
+Positive connect/read timeouts retain their millisecond budgets.
+`HttpURLConnection`'s unset/zero connect timeout remains unbounded, and
+`HttpRequest.timeout` is one absolute monotonic deadline spanning connect,
+TLS handshake, request write, and every response read. One current platform
+limitation remains: `jolt.net` resolves names through synchronous
+`getaddrinfo`. A result returned after the connect deadline is rejected, but an
+in-flight resolver call cannot yet be preempted, so wall-clock connect time can
+overrun the configured budget while DNS is blocked.
 
 ## Requirements
 
@@ -47,12 +58,15 @@ under `:jolt/native`; jolt loads them before the namespaces are required.
 `joltc -M:test` runs clj-http-lite's own `client`, `links` and `integration`
 suites under Jolt. The suites are vendored under `test/clj_http/lite`; their
 `server-process` fixture is replaced with in-process plaintext + TLS servers
-(`jolt.http.test-server`, over `jolt.ffi` sockets + OpenSSL) in place of the
-suite's Jetty subprocess — no external checkout needed.
+(`jolt.http.test-server`, with a test-only listener feeding the same opaque byte
+transport + OpenSSL engine) in place of the suite's Jetty subprocess — no
+external checkout needed.
 
 ```
 joltc -M:test
 ```
 
-All 60 tests pass (116 assertions), including the self-signed-cert TLS test and
-the gzip/deflate decompression tests.
+The main suite includes deterministic transport/deadline and TLS error-ordering
+tests in addition to clj-http-lite's integration suite. Separate
+`joltc -M:bhctest` and `joltc -M:zlibtest` aliases cover babashka.http-client and
+libz.

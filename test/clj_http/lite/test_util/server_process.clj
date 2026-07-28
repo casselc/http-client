@@ -9,9 +9,15 @@
 (def ^:private https-port 18092)
 
 (defn launch []
-  (let [pwd  (jolt.host/getenv "JOLT_PWD")
+  (let [pwd  (or (jolt.host/getenv "JOLT_PWD")
+                 (System/getProperty "user.dir")
+                 (jolt.host/getenv "PWD"))
         cert (str pwd "/test/resources/cert.pem")
         key  (str pwd "/test/resources/key.pem")
+        _ (doseq [path [cert key]]
+            (when-not (.exists (java.io.File. path))
+              (throw (ex-info (str "TLS test fixture not found: " path)
+                              {:path path}))))
         plain (srv/start-plain http-port)
         tls   (srv/start-tls https-port cert key)]
     (Thread/sleep 300)
