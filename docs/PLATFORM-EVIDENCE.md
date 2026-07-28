@@ -45,6 +45,13 @@ This was the fork's first run, so every Chez cache was cold and each job built
 Chez 10.4.1 from source. Those timings are baseline evidence for the separate
 shared-toolchain migration; they are not a claim about steady-state CI cost.
 
+Documentation-tip
+[run `30395142509`](https://github.com/casselc/http-client/actions/runs/30395142509)
+then restored all four repository-local caches, skipped every Chez build, and
+repeated the same green gates at `69cdde90b59fa5b8aa5840e6d2c06c644c0faf54`.
+Warm job times were 1m02s (Linux x86_64), 1m07s (Linux aarch64), 1m39s
+(Windows x86_64), and 3m15s (Windows aarch64).
+
 ### Linux x86_64 (local, glibc)
 
 | lane | alias | result |
