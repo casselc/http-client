@@ -10,9 +10,9 @@
   TLS and content-encoding are capabilities selected on first use, never at
   load. Two properties make that safe:
 
-    - the provider namespaces (jolt.http.tls, jolt.http.zlib) are required
-      lazily here, so a graph that never speaks https or handles compressed
-      content never loads them;
+    - the provider namespaces (jolt.http.tls or jolt.http.schannel, and
+      jolt.http.zlib) are required lazily here, so a graph that never speaks
+      https or handles compressed content never loads them;
     - jolt.ffi resolves a `defcfn` binding when it is *called*, not when the
       namespace loads, so requiring a provider whose shared object is absent
       does not abort — which is precisely why a load alone proves nothing and
@@ -35,14 +35,23 @@
 ;; it installs the java.security.SecureRandom shim clj-http-lite's insecure
 ;; (trust-all) path constructs, and its own provider selection is eager, so it
 ;; must not be pulled into the plaintext graph.
+(def ^:private tls-capability
+  ;; TLS is a client capability. jolt.http.tls also contains a server wrapper
+  ;; used directly by the POSIX test fixture; it is not part of this SPI.
+  (if (= :windows (:os (jolt.host/target)))
+    {:provider-ns 'jolt.http.schannel
+     :also-load   ['jolt.crypto]
+     :probe       'jolt.http.schannel/available?
+     :libraries   ["Secur32.dll" "bcrypt.dll"]
+     :exports     {:connect 'jolt.http.schannel/tls-connect}}
+    {:provider-ns 'jolt.http.tls
+     :also-load   ['jolt.crypto]
+     :probe       'jolt.http.tls/available?
+     :libraries   ["libssl" "libcrypto"]
+     :exports     {:connect 'jolt.http.tls/tls-connect}}))
+
 (def ^:private capabilities
-  {:tls
-   {:provider-ns 'jolt.http.tls
-    :also-load   ['jolt.crypto]
-    :probe       'jolt.http.tls/available?
-    :libraries   ["libssl" "libcrypto"]
-    :exports     {:connect     'jolt.http.tls/tls-connect
-                  :wrap-server 'jolt.http.tls/tls-wrap-server}}
+  {:tls tls-capability
 
    :compression
    {:provider-ns 'jolt.http.zlib

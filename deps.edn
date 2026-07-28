@@ -52,6 +52,15 @@
            ;; Reports which optional capabilities resolved on this platform.
            :capability {:extra-paths ["test"]
                         :main-opts ["-m" "jolt.http.capability-test"]}
+           ;; Portable Schannel buffer/ownership contracts. The namespace's FFI
+           ;; bindings are lazy, so this runs on POSIX without Secur32.dll; the
+           ;; dedicated Windows gate adds the real ABI and loopback handshake.
+           :schannel-contract-test
+           {:extra-paths ["test"]
+            :main-opts ["-m" "jolt.http.schannel-test"]}
+           :schannel-runtime-test
+           {:extra-paths ["test"]
+            :main-opts ["-m" "jolt.http.schannel-runtime-test"]}
            ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
            :zlibtest {:extra-paths ["test"]
                       :main-opts ["-m" "jolt.http.zlib-test"]}
