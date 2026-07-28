@@ -1,0 +1,63 @@
+; Bounded claim: tail-bytes copies an SSPI SECBUFFER_EXTRA suffix into the
+; next input without changing its length or byte order.
+; Domain: input and suffix lengths 0..4. Expected: unsat.
+
+(set-option :produce-unsat-cores true)
+
+(declare-const input_length Int)
+(declare-const extra_length Int)
+(declare-const copy_start Int)
+(declare-const carry_length Int)
+(declare-const next_length Int)
+(declare-const input (Array Int Int))
+(declare-const carry (Array Int Int))
+(declare-const next_input (Array Int Int))
+(declare-const byte_mismatch Bool)
+(declare-const violation Bool)
+
+(assert (! (and (<= 0 input_length) (<= input_length 4)
+                (<= 0 extra_length) (<= extra_length input_length))
+           :named bounded_valid_lengths))
+(assert (! (= copy_start (- input_length extra_length))
+           :named tail_copy_starts_at_n_minus_extra))
+(assert (! (= carry_length extra_length)
+           :named carry_length_is_extra_length))
+(assert (! (= next_length carry_length)
+           :named next_input_length_is_carry_length))
+(assert (! (and
+  (=> (> extra_length 0)
+      (= (select carry 0) (select input (+ copy_start 0))))
+  (=> (> extra_length 1)
+      (= (select carry 1) (select input (+ copy_start 1))))
+  (=> (> extra_length 2)
+      (= (select carry 2) (select input (+ copy_start 2))))
+  (=> (> extra_length 3)
+      (= (select carry 3) (select input (+ copy_start 3)))))
+  :named arraycopy_preserves_suffix_order))
+(assert (! (and
+  (=> (> carry_length 0) (= (select next_input 0) (select carry 0)))
+  (=> (> carry_length 1) (= (select next_input 1) (select carry 1)))
+  (=> (> carry_length 2) (= (select next_input 2) (select carry 2)))
+  (=> (> carry_length 3) (= (select next_input 3) (select carry 3))))
+  :named carry_becomes_next_input))
+(assert (! (= byte_mismatch (or
+  (and (> extra_length 0)
+       (distinct (select next_input 0)
+                 (select input (+ (- input_length extra_length) 0))))
+  (and (> extra_length 1)
+       (distinct (select next_input 1)
+                 (select input (+ (- input_length extra_length) 1))))
+  (and (> extra_length 2)
+       (distinct (select next_input 2)
+                 (select input (+ (- input_length extra_length) 2))))
+  (and (> extra_length 3)
+       (distinct (select next_input 3)
+                 (select input (+ (- input_length extra_length) 3))))))
+  :named byte_mismatch_definition))
+(assert (! (= violation
+              (or (distinct next_length extra_length) byte_mismatch))
+           :named conservation_violation_definition))
+(assert (! violation :named property_violated))
+
+(check-sat)
+(get-unsat-core)
