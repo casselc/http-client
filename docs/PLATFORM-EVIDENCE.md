@@ -1,4 +1,4 @@
-# W10A platform evidence
+# W10A/W10B platform evidence
 
 What was actually run, on what, with which pins. Observed results only;
 platforms not covered by the current workflow are named as such.
@@ -51,6 +51,38 @@ then restored all four repository-local caches, skipped every Chez build, and
 repeated the same green gates at `69cdde90b59fa5b8aa5840e6d2c06c644c0faf54`.
 Warm job times were 1m02s (Linux x86_64), 1m07s (Linux aarch64), 1m39s
 (Windows x86_64), and 3m15s (Windows aarch64).
+
+### W10B Schannel checkpoint
+
+Source revision `8fd5d89e95f61f1b1dde76b6a74b2571eff99b6b`
+passed all four configured targets in
+[run `30400231076`](https://github.com/casselc/http-client/actions/runs/30400231076).
+Both Windows lanes ran a real Schannel client against a PowerShell-owned
+self-signed TLS origin; this was not descriptor-only evidence.
+
+| target | unchanged/base gates | Schannel evidence |
+| --- | --- | --- |
+| Linux x86_64 | full suite 85/206, babashka 7/11, capability 10/56, plaintext 17/55 | all 9 bounded model verdicts match |
+| Linux aarch64 | same counts and provider report as x86_64 | all 9 bounded model verdicts match |
+| Windows x86_64 | plaintext 17/55, capability 10/47 with `:tls true` | portable contracts 10/32; native TLS 2/11; fixture `failed,served,failed` |
+| Windows aarch64 | same counts, native `tarm64nt` and `aarch64` assertions | portable contracts 10/32; native TLS 2/11; fixture `failed,served,failed` |
+
+Every count above had zero failures and zero errors. Both Windows plaintext
+runs still reported provider namespaces `[]`; adding HTTPS did not make an
+unencoded plaintext request initialize Schannel, zlib, or jolt-crypto.
+
+The native sequence proves automatic certificate validation rejects the
+self-signed origin, explicit `:insecure? true` completes a real HTTPS/HTTP
+exchange, and a following secure connection rejects again. The fixture sends a
+real `close_notify`. During local development it exposed and prevented two
+false greens: PowerShell 5.1 `SslStream.Dispose` did not send the alert, and an
+unchanged encrypted input slot could be mistaken for final plaintext on
+`SEC_I_CONTEXT_EXPIRED`.
+
+The final run also reprobed both Schannel ABIs and compared them byte-for-byte
+with `tools/probed/schannel-windows-{x86-64,aarch64}.edn`. Both architectures
+have the same layouts, constants, status values, and default-credential
+behavior apart from the declared architecture.
 
 ### Linux x86_64 (local, glibc)
 
@@ -129,6 +161,8 @@ claim until those rows execute successfully.
 | --- | --- | --- |
 | `-M:plaintext-test` | yes | origin is `jolt.http.portable-server` on `teensyp.server`; no TLS/zlib namespace loads |
 | `-M:capability` | yes | no native library required to run |
+| `-M:schannel-contract-test` | yes | pure buffer, ownership, and validation-mode contracts; FFI bindings remain lazy |
+| `-M:schannel-runtime-test` | Windows only | real SSPI/Schannel client and TLS loopback fixture |
 | `-M:test` | POSIX only | `jolt.http.test-server` opens its listener with raw POSIX `socket`/`bind`/`listen`/`accept`; the TLS half needs OpenSSL |
 | `-M:bhctest` | POSIX only | uses the same POSIX `jolt.http.test-server` |
 | `-M:zlibtest` | needs libz | direct libz round-trip |
@@ -141,9 +175,6 @@ raw POSIX sockets onto `teensyp.server`; that is a separate change.
 ## Remaining platform work
 
 - Add macOS x86_64 and arm64 hosted rows.
-- Windows TLS needs a Schannel provider behind the `:tls` capability.
-  jolt-crypto's Windows CNG backend provides AES/HMAC/digest/RNG only and is
-  **not** a TLS implementation — it does not substitute for Schannel.
 - Windows compression needs a native compression provider behind the
   `:compression` capability.
 - Porting the POSIX test origin onto `teensyp.server` would let the
@@ -181,9 +212,9 @@ implementation rather than restarted. Findings and what was done:
   and the kernel backlog covers the gap; the sleep was guessing at an
   impossible race. Removed, and `-M:test` was re-run three times to confirm.
 
-No new formal model was added. Lifecycle, deadline and ownership semantics were
-not changed by this slice — the capability seam sits above the transport and
-alters only *which provider* is selected, never how a connection is opened,
+W10A added no new formal model. Lifecycle, deadline and ownership semantics
+were not changed by that slice — the capability seam sits above the transport
+and alters only *which provider* is selected, never how a connection is opened,
 bounded or closed — and the inherited deterministic tests already cover those
 semantics directly.
 
@@ -198,3 +229,10 @@ a separate custom capability state machine or SMT model would duplicate the
 primitive rather than strengthen this layer's evidence. Present/absent
 selection and the end-to-end clj-http-lite decompression refusal remain covered
 by `capability-test`.
+
+W10B does cross a new native state machine, so it adds three bounded proof
+families with one-assertion buggy controls and non-vacuity witnesses:
+`SECBUFFER_EXTRA` conservation, Schannel-owned output-token retirement, and
+connection-local validation-mode isolation. Their exact scope, source anchors,
+assumptions, and Chiasmus/standalone-Z3 evidence are in
+`docs/proofs/schannel-invariants.md`.

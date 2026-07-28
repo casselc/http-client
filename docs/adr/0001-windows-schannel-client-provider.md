@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for implementation. Both Windows x86-64 and ARM64 ABI records and
-default-credential premises were probed natively. Each hosted lane now compares
+Implemented on the proposal branch. Both Windows x86-64 and ARM64 ABI records
+and default-credential premises were probed natively. Each hosted lane compares
 fresh evidence byte-for-byte with its committed descriptor.
 
 ## Context
@@ -103,11 +103,18 @@ The implementation must preserve these boundaries:
 4. `EncryptMessage` sends exactly the returned header, data, and trailer
    windows, split at `cbMaximumMessage`.
 5. `SEC_I_CONTEXT_EXPIRED` is clean TLS EOF. Raw transport EOF without that
-   status is truncation.
+   status is truncation. Plaintext returned in an output slot alongside the
+   close notification is delivered once before EOF; the original encrypted
+   input slot is never classified as plaintext merely because its type remains
+   `SECBUFFER_DATA`.
 6. `SEC_I_RENEGOTIATE`, including TLS 1.3 post-handshake processing, returns to
-   the same token loop rather than being treated as application data.
+   the same token loop rather than being treated as application data. When
+   Schannel reports no extra token, the first renegotiation step calls
+   `InitializeSecurityContextW` with empty input before waiting for more bytes.
 7. Credential and context handles are retired once, after the last operation;
-   transport close remains idempotent.
+   transport close remains idempotent. A failure while allocating a later
+   caller-owned native object unwinds all earlier allocations and closes a
+   transport that has not yet been published.
 8. Every network read/write receives the caller's existing absolute deadline
    options unchanged.
 9. The secure path can never select manual validation, and the trust-all flag

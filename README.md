@@ -29,7 +29,7 @@ map.
 | `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over the opaque `teensyp.client` API from `jolt-tcp` (`jolt.http.net` / `jolt.http.platform`) |
 | `java.io.ByteArrayInput/OutputStream` | byte-stream tagged-tables wired into `io/copy` / `slurp` |
 | `java.util.zip` (gzip/deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
-| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the opaque jolt-tcp transport (`jolt.http.tls`) |
+| `javax.net.ssl` (https, `insecure?`) | platform TLS over the opaque jolt-tcp transport: **OpenSSL** memory BIOs on POSIX (`jolt.http.tls`), **Schannel** on Windows (`jolt.http.schannel`) |
 | `java.net.http.HttpClient` (JDK 11+ client) | construction, getters, and synchronous/live-settled sends for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by babashka.http-client and cognitect aws-api's java backend |
 
 `jolt-tcp` and its transitive `jolt-net` dependency own platform socket
@@ -44,11 +44,11 @@ attempts optional native-library candidates while resolving the dependency
 graph; a library already installed on the host may therefore be mapped before
 its provider namespace is used.
 
-| | plaintext HTTP | https (OpenSSL TLS) | gzip/deflate (libz) |
+| | plaintext HTTP | https | gzip/deflate (libz) |
 | --- | --- | --- | --- |
-| Linux x86_64 / aarch64 | yes | yes | yes |
-| macOS | yes | yes | yes |
-| Windows x86_64 / aarch64 | yes | not yet — see below | not yet — see below |
+| Linux x86_64 / aarch64 | yes | yes — OpenSSL | yes |
+| macOS | yes | yes — OpenSSL | yes |
+| Windows x86_64 / aarch64 | yes | yes — system Schannel | not yet — see below |
 
 Where a capability has no provider it **fails closed**. Requesting `https://`,
 or constructing one of the `java.util.zip` streams, raises an `ex-info` carrying
@@ -56,7 +56,7 @@ or constructing one of the `java.util.zip` streams, raises an `ex-info` carrying
 ```clojure
 {:jolt.http/kind :unsupported-provider
  :jolt.http/capability :tls            ; or :compression
- :jolt.http/libraries ["libssl" "libcrypto"]
+ :jolt.http/libraries ["libssl" "libcrypto"] ; provider-specific
  :jolt.http/target {:os :windows :arch :x86-64 ...}}
 ```
 
@@ -66,10 +66,11 @@ with the structured refusal; no response map is returned.
 `jolt.http.capability/report` actively resolves both providers and reports the
 result for the running platform.
 
-Windows TLS would need a Schannel provider and Windows compression a native
-compression provider; neither is in this slice. Note that jolt-crypto's Windows
-CNG backend supplies AES/HMAC/digest/RNG only — it is **not** a TLS
-implementation and does not substitute for Schannel.
+Windows compression still needs a provider. Windows TLS does not route raw
+crypto through jolt-crypto: `jolt.http.schannel` calls the operating system's
+SSPI/Schannel client API directly, while jolt-crypto's CNG backend supplies the
+`SecureRandom` compatibility shim used by clj-http-lite's explicit trust-all
+path.
 
 Native declarations: this project declares `libz` and `libssl` as `:optional`
 capability libraries; `jolt-crypto` declares `libcrypto`/`bcrypt`, also
@@ -89,8 +90,10 @@ overrun the configured budget while DNS is blocked.
 ## Requirements
 
 - Nothing native for plaintext HTTP.
-- System OpenSSL (`libssl`/`libcrypto`) for https, and `libz` for
-  gzip/deflate — optional, and only where those capabilities are used.
+- System OpenSSL (`libssl`/`libcrypto`) for https on POSIX. Windows uses its
+  built-in `Secur32.dll` Schannel provider and needs no TLS artifact download.
+- System `libz` for gzip/deflate — optional, and only where that capability is
+  used.
 - A `jolt` build with the library-shim host hooks (`__register-class-methods!` /
   `__register-instance-check!`) and the FFI byte-buffer / charset support this
   library relies on. The pinned `jolt-net` needs host/FFI primitives a released
@@ -127,6 +130,21 @@ joltc -M:plaintext-test   # real loopback HTTP over jolt-tcp, no TLS, no zlib
 joltc -M:capability       # provider seam: resolved providers and fail-closed refusals
 ```
 
+Schannel adds two focused aliases:
+
+```text
+joltc -M:schannel-contract-test # portable buffer/ownership contracts
+joltc -M:schannel-runtime-test  # native Windows TLS fixture; normally run by tools/test-windows-schannel.ps1
+```
+
+The native gate makes three ordered connections to a self-signed loopback
+origin: secure rejection, explicit `:insecure? true` success with a complete
+HTTP exchange, then secure rejection again. The fixture emits a real
+`close_notify`; raw transport EOF without one remains a truncation error. The
+checked-in ABI probes cover both Windows x86-64 and ARM64, and
+`tools/verify-models.sh` checks the bounded suffix-conservation,
+output-token-retirement, and validation-isolation models.
+
 `-M:plaintext-test` serves its requests from `jolt.http.portable-server`, an
 origin built on `teensyp.server` from jolt-tcp rather than raw POSIX sockets, so
 the same suite witnesses the same behaviour on every platform. It covers GET /
@@ -148,3 +166,11 @@ passed the complete Linux suite and portable loopback/capability gates on
 native Linux x86_64/aarch64 and Windows x86-64/aarch64 at
 `0e43a6c132fa977e7f22882514053319560d7676`. Exact counts and evidence
 boundaries are recorded in [`docs/PLATFORM-EVIDENCE.md`](docs/PLATFORM-EVIDENCE.md).
+
+Schannel promotion run
+[`30400231076`](https://github.com/casselc/http-client/actions/runs/30400231076)
+then passed native HTTPS on both Windows x86-64 and ARM64 at `8fd5d89`: each
+ran 10/32 portable contracts and 2/11 native TLS assertions with the exact
+secure/insecure/secure fixture outcome `failed,served,failed`. Both Linux
+architectures retained the full 85/206 OpenSSL suite and checked all nine
+declared proof-model verdicts.
