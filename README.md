@@ -141,3 +141,10 @@ provider namespace.
 
 Set `JOLT_EXPECTED_ARCH` (`x86-64` or `aarch64`) to make the lane refuse to run
 under architecture emulation.
+
+Hosted run
+[`30394288147`](https://github.com/casselc/http-client/actions/runs/30394288147)
+passed the complete Linux suite and portable loopback/capability gates on
+native Linux x86_64/aarch64 and Windows x86-64/aarch64 at
+`0e43a6c132fa977e7f22882514053319560d7676`. Exact counts and evidence
+boundaries are recorded in [`docs/PLATFORM-EVIDENCE.md`](docs/PLATFORM-EVIDENCE.md).

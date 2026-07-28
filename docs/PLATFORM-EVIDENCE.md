@@ -1,7 +1,7 @@
 # W10A platform evidence
 
-What was actually run, on what, with which pins. Observed results only; lanes
-that were configured but not executed are named as such.
+What was actually run, on what, with which pins. Observed results only;
+platforms not covered by the current workflow are named as such.
 
 ## Pinned stack
 
@@ -21,6 +21,29 @@ were fetched at exactly these SHAs into empty caches on both platforms below.
 Source/runtime mode throughout: interpreted source mode against the pinned core
 (`bin/jolt` on Linux; native Chez 10.4.1 driving `host\chez\cli.ss` on
 Windows, with `JOLT_AOT_CACHE=0`). No packaged/released `joltc` was used.
+
+### Hosted checkpoint
+
+Source revision `0e43a6c132fa977e7f22882514053319560d7676` passed all four
+configured native targets in
+[run `30394288147`](https://github.com/casselc/http-client/actions/runs/30394288147):
+
+| target | native evidence | result | cold job time |
+| --- | --- | --- | --- |
+| Linux x86_64 | full TLS/compression suite, babashka surface, capabilities, plaintext loopback | 75/174, 7/11, 10/57, 17/55 | 5m12s |
+| Linux aarch64 | same four gates, native `aarch64` target assertion | 75/174, 7/11, 10/57, 17/55 | 3m44s |
+| Windows x86_64 | plaintext loopback and absent-provider contract | 17/55, 10/45 | 9m35s |
+| Windows aarch64 | same two gates, native `tarm64nt` and `aarch64` assertions | 17/55, 10/45 | 7m05s |
+
+All counts are tests/assertions except the five-check libz gate, which also
+passed on both Linux targets. The Windows capability reports were
+`{:plaintext true :tls false :compression false}`; both plaintext runs asserted
+that no TLS, compression, or crypto provider namespace loaded. Linux reported
+both optional providers present.
+
+This was the fork's first run, so every Chez cache was cold and each job built
+Chez 10.4.1 from source. Those timings are baseline evidence for the separate
+shared-toolchain migration; they are not a claim about steady-state CI cost.
 
 ### Linux x86_64 (local, glibc)
 
@@ -86,18 +109,12 @@ Reproduction (from WSL, project staged at
   -ExpectedArch 'x86-64' -TestAlias '-M:plaintext-test' -TimeoutSeconds 1200
 ```
 
-## Configured but NOT observed
+## Not yet covered by hosted CI
 
-- **Windows aarch64.** The `windows-arm64-plaintext` job exists and reuses
-  jolt-tcp's proven ARM64 recipe (native `tarm64nt` Chez built from source, a
-  runner-arch assertion, and a `machine-type` check), and the lane's own
-  `JOLT_EXPECTED_ARCH=aarch64` gate makes an emulated x86-64 process fail before
-  any assertion can pass. No ARM64 Windows host was available here, so this is
-  the next lane — it has not been run.
-- **Linux aarch64** (`posix` matrix) and the CI lanes generally: the workflow
-  was not executed, because this branch has no push access to
-  `jolt-lang/http-client`. The Linux results above were produced locally with
-  the same aliases the workflow invokes.
+The current workflow has no macOS x86_64 or arm64 row. The portable plaintext
+and capability gates, POSIX compatibility suites, and lower jolt-tcp/jolt-net
+stack are intended to support macOS, but this branch makes no hosted macOS
+claim until those rows execute successfully.
 
 ## Platform boundaries
 
@@ -116,6 +133,7 @@ raw POSIX sockets onto `teensyp.server`; that is a separate change.
 
 ## Remaining platform work
 
+- Add macOS x86_64 and arm64 hosted rows.
 - Windows TLS needs a Schannel provider behind the `:tls` capability.
   jolt-crypto's Windows CNG backend provides AES/HMAC/digest/RNG only and is
   **not** a TLS implementation — it does not substitute for Schannel.
