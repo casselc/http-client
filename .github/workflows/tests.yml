@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev \
-            libncurses-dev uuid-dev libssl-dev
+            libncurses-dev uuid-dev libssl-dev z3
 
       - name: Cache Chez Scheme
         id: cache-chez
@@ -112,12 +112,16 @@ jobs:
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:plaintext-test
 
+      - name: Schannel bounded proof models
+        run: tools/verify-models.sh
+
   # ---------------------------------------------------------------------------
   # Native Windows: the claim this slice exists to make. Plaintext HTTP through
   # the unchanged clj-http-lite API, over jolt-tcp, against a real loopback
-  # origin, on a platform carrying neither OpenSSL nor zlib. The gate fails if
-  # any provider namespace is loaded during the run, so it cannot quietly become
-  # a POSIX-shaped test that happens to pass.
+  # origin, on a platform carrying neither OpenSSL nor zlib. Windows HTTPS uses
+  # its native Schannel provider, but the plaintext gate still fails if any
+  # provider namespace is loaded during that run, so it cannot quietly become a
+  # TLS-shaped test that happens to pass.
   #
   # Source-runtime evidence only: official native Chez 10.4.1, AOT disabled, no
   # packaged joltc.
@@ -197,7 +201,7 @@ jobs:
           submodules: recursive
           path: jolt
 
-      - name: Plaintext loopback gate (real sockets, no OpenSSL, no zlib)
+      - name: Plaintext loopback gate (real sockets, no TLS or zlib provider)
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
@@ -210,9 +214,6 @@ jobs:
             -TestAlias '-M:plaintext-test' `
             -TimeoutSeconds 900
 
-      # Proves the refusal, not merely the absence: on a platform with no TLS
-      # and no zlib the capability suite is what shows https and gzip failing
-      # closed with the structured error rather than degrading.
       - name: Capability seam
         shell: powershell
         env:
@@ -224,6 +225,18 @@ jobs:
             -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
             -ExpectedArch 'x86-64' `
             -TestAlias '-M:capability' `
+            -TimeoutSeconds 600
+
+      - name: Native Schannel TLS gate
+        shell: powershell
+        env:
+          JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-schannel.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ExpectedArch 'x86-64' `
             -TimeoutSeconds 600
 
   # ---------------------------------------------------------------------------
@@ -316,7 +329,7 @@ jobs:
             throw "expected a native tarm64nt Chez, got '$machine'"
           }
 
-      - name: Plaintext loopback gate (real sockets, no OpenSSL, no zlib)
+      - name: Plaintext loopback gate (real sockets, no TLS or zlib provider)
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
@@ -336,4 +349,14 @@ jobs:
             -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
             -ExpectedArch 'aarch64' `
             -TestAlias '-M:capability' `
+            -TimeoutSeconds 600
+
+      - name: Native Schannel TLS gate
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-schannel.ps1" `
+            -ProjectPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -ExpectedArch 'aarch64' `
             -TimeoutSeconds 600
