@@ -39,15 +39,29 @@ if (-not (Test-Path $vswhere)) {
   throw "probe-schannel.ps1: vswhere.exe not found: $vswhere"
 }
 
-$installation = (& $vswhere -latest -products * -property installationPath |
+$installation = (& $vswhere -latest -prerelease -products * `
+  -property installationPath |
   Select-Object -First 1)
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installation)) {
-  throw "probe-schannel.ps1: no Visual Studio installation found"
+$devcmd = if ([string]::IsNullOrWhiteSpace($installation)) {
+  $null
+}
+else {
+  Join-Path $installation "Common7\Tools\VsDevCmd.bat"
 }
 
-$devcmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
-if (-not (Test-Path $devcmd)) {
-  throw "probe-schannel.ps1: VsDevCmd.bat not found: $devcmd"
+# The Windows 11 ARM64 image carries the preview VS 2026 line. Older vswhere
+# builds have occasionally failed to enumerate that instance even with
+# -prerelease, so use the installed VsDevCmd file as the second and final source
+# of truth. We still fail closed if there is not exactly a usable toolchain.
+if ([string]::IsNullOrWhiteSpace($devcmd) -or -not (Test-Path $devcmd)) {
+  $visualStudioRoot = Join-Path $env:ProgramFiles "Microsoft Visual Studio"
+  $devcmd = Get-ChildItem $visualStudioRoot -Filter VsDevCmd.bat `
+    -File -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+}
+if ([string]::IsNullOrWhiteSpace($devcmd) -or -not (Test-Path $devcmd)) {
+  throw "probe-schannel.ps1: no usable Visual Studio VsDevCmd.bat found"
 }
 
 $vcArch = if ($ExpectedArch -eq "aarch64") { "arm64" } else { "amd64" }
