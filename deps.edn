@@ -35,4 +35,4 @@
                      :extra-deps {org.babashka/http-client {:mvn/version "0.4.23"}}
                      :main-opts ["-m" "jolt.http.babashka-test"]}}
 
- :tasks {test "joltc -M:test"}}
+ :tasks {test "jolt -M:test"}}
