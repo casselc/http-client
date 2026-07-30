@@ -283,10 +283,16 @@
   (doseq [nm ["ByteArrayOutputStream" "java.io.ByteArrayOutputStream"]]
     (__register-class-ctor! nm (fn [& _] (make-baos))))
   (__register-class-methods! :jolt/bais
+    ;; The no-arg read returns the byte as an UNSIGNED int 0..255, -1 at EOF —
+    ;; InputStream.read()'s contract, and the only way a caller can tell 0xff from
+    ;; end-of-stream. byte[] elements are signed, so mask. Unmasked, a high byte
+    ;; read as negative and every drain loop (io/copy's included) stopped there:
+    ;; (util/gzip …) silently truncated a body at its first non-ASCII byte.
+    ;; The read(buf …) arm fills a byte[], whose elements ARE signed — no mask.
     {"read" (fn [self & args]
               (let [b (tget self :bytes) p (tget self :pos) n (alength b)]
                 (if (empty? args)
-                  (if (>= p n) -1 (do (tput! self :pos (inc p)) (aget b p)))
+                  (if (>= p n) -1 (do (tput! self :pos (inc p)) (bit-and (aget b p) 0xff)))
                   (let [buf (first args)
                         off (or (second args) 0)
                         len (or (nth args 2 nil) (alength buf))]
