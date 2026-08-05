@@ -122,11 +122,44 @@
       (net/set-read-timeout! fd read-timeout)
       fd)))
 
+;; --- total response deadline ------------------------------------------------
+;; SO_RCVTIMEO bounds INACTIVITY, not total duration, so a peer that sends one
+;; byte every few seconds resets the timer forever and the request never returns.
+;; Measured: a 3000ms :socket-timeout against a server trickling a byte per
+;; second ran past two minutes and was still going.
+;;
+;; The bound goes in the read loop rather than in a watchdog, because a
+;; trickling peer is precisely one whose reads DO return, so the loop gets
+;; control regularly and can check the clock itself. The case where the loop
+;; does not get control is total silence, which SO_RCVTIMEO already covers. The
+;; two together bound the call from both sides.
+;;
+;; Set through a var rather than a request option because clj-http-lite forwards
+;; a fixed set of options to the connection and this is not one of them. nil
+;; means unbounded, which is the historical behaviour.
+(def ^:private max-response-ms (atom nil))
+
+(defn set-max-response-ms!
+  "Cap the total wall-clock time of a response body, across all reads.
+
+  Complements, and does not replace, the per-read `:socket-timeout`. Pass nil to
+  remove the cap. Applies process-wide to every request made through this
+  namespace."
+  [ms]
+  (reset! max-response-ms ms))
+
 (defn- recv-all [stream]
-  (loop [chunks []]
-    (if-let [b (s-read stream nil)]
-      (recur (conj chunks b))
-      (byte-array (mapcat seq chunks)))))
+  (let [cap @max-response-ms
+        deadline (when (and cap (pos? cap)) (+ (System/currentTimeMillis) cap))]
+    (loop [chunks []]
+      (when (and deadline (> (System/currentTimeMillis) deadline))
+        ;; Thrown, so perform!'s finally closes the stream. That is what stops a
+        ;; trickling peer leaking a socket and a parked thread per attempt.
+        (throw-typed "java.net.SocketTimeoutException"
+                     (str "Response exceeded the total time limit of " cap "ms")))
+      (if-let [b (s-read stream nil)]
+        (recur (conj chunks b))
+        (byte-array (mapcat seq chunks))))))
 
 (defn- header-ci [pairs name]
   (let [low (str/lower-case name)]

@@ -10,6 +10,7 @@
             [jolt.process :as p]
             [jolt.http.net :as net]
             [jolt.http.tls :as tls]
+            [jolt.http.platform :as platform]
             [jolt.http.test-server :as srv]
             [jolt.http-client :as http]))
 
@@ -105,3 +106,63 @@
   (let [{:keys [crypto ssl]} tls/loaded-openssl]
     (is (some? crypto) "libcrypto must be loaded by jolt.http.tls itself")
     (is (some? ssl) "libssl must be loaded by jolt.http.tls itself")))
+
+;; --- a peer that trickles rather than stalls --------------------------------
+;; SO_RCVTIMEO bounds inactivity, not total duration, so a peer sending one byte
+;; every few seconds resets the read timer forever and the request never
+;; returns. Measured before the fix: a 3000ms :socket-timeout against a
+;; one-byte-per-second server ran past two minutes and was still going. That
+;; leaks a socket and a parked thread per attempt, since nothing unwinds.
+
+(defn- start-trickling-tls [port]
+  (let [fd (srv/listen-socket port)
+        running? (atom true)]
+    (future
+      (loop []
+        (let [raw (srv/accept-raw fd)]
+          (when @running?
+            (when-not (neg? raw)
+              (future
+                (try
+                  (let [st (tls/tls-wrap-server raw cert key)
+                        write (jolt.host/ref-get st :write)]
+                    ((jolt.host/ref-get st :read) st nil)
+                    ;; Valid headers promising a body that never finishes...
+                    (write st (byte-array (map int "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")))
+                    ;; ...then one byte at a time, forever.
+                    (while @running?
+                      (write st (byte-array [(int \x)]))
+                      (Thread/sleep 200)))
+                  (catch Throwable _ nil))))
+            (recur)))))
+    {:fd fd :running running?}))
+
+(deftest a-trickling-peer-is-bounded-by-the-total-deadline
+  (let [port 18445
+        srv (start-trickling-tls port)]
+    (try
+      (platform/set-max-response-ms! 4000)
+      (let [t0 (System/currentTimeMillis)
+            outcome (try (http/get (str "https://127.0.0.1:" port "/")
+                                   {:insecure? true :socket-timeout 30000})
+                         :returned
+                         (catch Throwable e (class e)))
+            elapsed (- (System/currentTimeMillis) t0)]
+        (is (= java.net.SocketTimeoutException outcome)
+            "a peer that keeps the read timer alive must still hit a total bound")
+        (is (< elapsed 20000)
+            (str "should give up near the 4000ms cap, took " elapsed "ms")))
+      (finally
+        (platform/set-max-response-ms! nil)
+        (reset! (:running srv) false)
+        (net/close (:fd srv))))))
+
+(deftest no-cap-by-default
+  ;; The historical behaviour is unbounded, and a cap applies process-wide, so a
+  ;; library that quietly imposed one would change every consumer.
+  (let [port 18446
+        srv (srv/start-plain port)]
+    (try
+      (platform/set-max-response-ms! nil)
+      (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")))))
+      (finally (srv/stop srv)))))
