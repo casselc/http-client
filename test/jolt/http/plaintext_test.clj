@@ -50,6 +50,14 @@
     (origin/stop handle)
     bound))
 
+(deftest byte-input-stream-single-byte-read-is-an-unsigned-octet
+  ;; Java byte[] elements are signed, but InputStream.read() is deliberately
+  ;; unsigned so 0xff remains distinguishable from the -1 EOF sentinel.
+  (let [stream (java.io.ByteArrayInputStream.
+                (byte-array [0 127 128 255]))]
+    (is (= [0 127 128 255 -1]
+           (mapv (fn [_] (.read stream)) (range 5))))))
+
 ;; --- the capability claim ---------------------------------------------------
 
 (def ^:private provider-namespaces ['jolt.http.tls 'jolt.http.zlib 'jolt.crypto])
