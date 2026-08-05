@@ -117,9 +117,9 @@
 ;; --- HTTP/1.1 client -------------------------------------------------------
 (defn- connect-stream [host port https? insecure? read-timeout]
   (if https?
-    (tls/tls-connect host port insecure?)
+    (tls/tls-connect host port insecure? read-timeout)
     (let [fd (net/connect (str host) port)]
-      (when (and read-timeout (pos? read-timeout)) (net/set-read-timeout! fd read-timeout))
+      (net/set-read-timeout! fd read-timeout)
       fd)))
 
 (defn- recv-all [stream]

@@ -4,12 +4,59 @@
   so no raw-fd access into OpenSSL is needed and an in-process client + server can
   share one process.
 
-  libssl/libcrypto are declared in deps.edn (:jolt/native) and loaded before this
-  namespace, so the foreign-fn bindings resolve at load. A TLS stream is a host
-  tagged-table carrying :write / :read / :close closures; jolt.http.platform
+  libssl/libcrypto are declared in deps.edn (:jolt/native), but this namespace
+  re-loads them itself immediately below — see ensure-openssl!. A TLS stream is a
+  host tagged-table carrying :write / :read / :close closures; jolt.http.platform
   dispatches socket ops through them."
-  (:require [jolt.ffi :as ffi]
+  (:require [clojure.string :as str]
+            [jolt.ffi :as ffi]
             [jolt.http.net :as net]))
+
+;; --- pinning the right OpenSSL ---------------------------------------------
+;; Chez resolves a foreign symbol against loaded shared objects most-recent-first,
+;; and `defcfn` resolves when the def is evaluated. So whichever object was loaded
+;; last before this namespace loads wins the SSL_* symbols.
+;;
+;; That is a live hazard on macOS, where the process image transitively links
+;; /usr/lib/libssl.dylib — LibreSSL, not OpenSSL. Any library that calls
+;; `(ffi/load-library)` with no argument, which loads the running process's own
+;; symbols, therefore puts LibreSSL ahead of the OpenSSL that :jolt/native
+;; loaded. jolt.nrepl does exactly that at ns load to bind sockets. The result is
+;; not a missing symbol but a SILENT MIX: TLS_client_method comes from one
+;; implementation and SSL_CTX_new from the other, whose SSL_CTX layouts disagree,
+;; and the first call through it faults with "invalid memory reference".
+;;
+;; Loading the libraries again here re-asserts them as most-recent at exactly the
+;; point the bindings below resolve, which makes this namespace independent of
+;; who loaded what first. load-shared-object on an already-loaded object is cheap
+;; and does not duplicate it. The candidate lists mirror jolt-lang/jolt-crypto's
+;; :jolt/native, homebrew before /usr/lib, so the OpenSSL build is preferred and
+;; the system LibreSSL is only a last resort.
+(def ^:private openssl-candidates
+  (if (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac")
+    {:crypto ["/opt/homebrew/opt/openssl@3/lib/libcrypto.dylib"
+              "/usr/local/opt/openssl@3/lib/libcrypto.dylib"
+              "libcrypto.dylib" "/usr/lib/libcrypto.dylib"]
+     :ssl    ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib"
+              "/usr/local/opt/openssl@3/lib/libssl.dylib"
+              "libssl.dylib" "/usr/lib/libssl.dylib"]}
+    {:crypto ["libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so"]
+     :ssl    ["libssl.so.3" "libssl.so.1.1" "libssl.so"]}))
+
+(defn- load-first! [candidates]
+  (some (fn [path]
+          (when (try (ffi/load-library path) true (catch Throwable _ false))
+            path))
+        candidates))
+
+;; crypto first, then ssl: ssl ends up most-recent and wins SSL_*, while symbols
+;; it does not define (EVP_*, ERR_*) fall through to crypto, still ahead of the
+;; process. Returns the pair actually loaded, which the AOT/load-order tests read.
+(defn ensure-openssl! []
+  {:crypto (load-first! (:crypto openssl-candidates))
+   :ssl    (load-first! (:ssl openssl-candidates))})
+
+(def loaded-openssl (ensure-openssl!))
 
 ;; SSL_get_error codes / verify modes / ctrl commands.
 (def ^:private WANT-READ 2)
@@ -149,8 +196,13 @@
 
 (defn tls-connect
   "Open a TLS client connection to host:port. insecure? disables peer
-  verification (self-signed/expired certs accepted)."
-  [host port insecure?]
+  verification (self-signed/expired certs accepted). read-timeout, in
+  milliseconds, bounds every recv on the underlying socket — both the handshake
+  and the ciphertext reads that back SSL_read — so a peer that accepts the
+  connection and then goes silent surfaces as a SocketTimeoutException rather
+  than parking the calling thread forever."
+  ([host port insecure?] (tls-connect host port insecure? nil))
+  ([host port insecure? read-timeout]
   (let [ctx (c-SSL-CTX-new (c-TLS-client-method))]
     (when (ffi/null? ctx) (throw (ssl-ex "SSL_CTX_new failed")))
     (if insecure?
@@ -167,11 +219,12 @@
       (c-SSL-ctrl ssl SET-TLSEXT-HOSTNAME NAMETYPE-host-name host-buf)  ; SNI
       (when-not insecure? (c-SSL-set1-host ssl host-buf))
       (let [sock (net/connect host port)
+            _    (net/set-read-timeout! sock read-timeout)
             st   (make-stream sock ssl ctx rbio wbio)]
         (try (handshake! st true)
              (catch Throwable e ((jolt.host/ref-get st :close)) (ffi/free host-buf) (throw e)))
         (ffi/free host-buf)
-        st))))
+        st)))))
 
 (defn tls-wrap-server
   "Wrap an accepted plain socket fd `sock` as the server side of a TLS session,

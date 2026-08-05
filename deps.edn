@@ -26,6 +26,11 @@
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "jolt.http.test-runner"]}
+           ;; https read-timeout + OpenSSL symbol-pinning regressions. Separate
+           ;; process: they stall a connection on purpose and stand up their own
+           ;; servers, which the main suite's serial accept loop doesn't tolerate.
+           :timeouttest {:extra-paths ["test"]
+                         :main-opts ["-m" "jolt.http.timeout-runner"]}
            ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
            :zlibtest {:extra-paths ["test"]
                       :main-opts ["-m" "jolt.http.zlib-test"]}
@@ -35,4 +40,5 @@
                      :extra-deps {org.babashka/http-client {:mvn/version "0.4.23"}}
                      :main-opts ["-m" "jolt.http.babashka-test"]}}
 
- :tasks {test "jolt -M:test"}}
+ :tasks {test "jolt -M:test"
+         timeouttest "jolt -M:timeouttest"}}

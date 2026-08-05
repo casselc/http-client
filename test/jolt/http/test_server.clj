@@ -46,6 +46,13 @@
     (when (neg? (c-listen fd 64)) (net/close fd) (throw (ex-info "listen() failed" {})))
     fd))
 
+(defn accept-raw
+  "Block until a connection arrives on `listen-fd`; return the raw fd. Exposed so
+  a test can drive its own accept loop (e.g. a server that answers the handshake
+  and then deliberately never replies)."
+  [listen-fd]
+  (c-accept listen-fd ffi/null ffi/null))
+
 ;; --- connection read/write (plain fd or TLS stream) ------------------------
 (defn- conn-read [conn] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :read) conn nil) (net/recv-bytes conn)))
 (defn- conn-write [conn data] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :write) conn data) (net/send-bytes conn data)))
