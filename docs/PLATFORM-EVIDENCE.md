@@ -1,17 +1,16 @@
 # W10A/W10B and shared-toolchain platform evidence
 
-This separates the current compatibility target from the runtime evidence
-already observed against its predecessor. Platforms not covered by the current
-workflow are named as such.
+This records the current compatibility target and its exact source-runtime
+evidence separately from predecessor checkpoints. Platforms not covered by the
+current workflow are named as such.
 
 ## Current compatibility target
 
-The source and workflow now target the same current Jolt core, jolt-tcp, and
-jolt-net spine already exercised by jolt-sim. This refresh performed static
-compatibility checks only; jolt-sim does not establish this client's
-clj-http-lite, TLS, compression, or Schannel behavior. The observed runtime
-evidence below remains attached to the prior stack until the serial local gates
-and hosted matrix pass this exact candidate.
+The source and workflow target the same current Jolt core, jolt-tcp, and
+jolt-net spine already exercised by jolt-sim. The exact candidate now has its
+own six-target hosted source-runtime evidence below; jolt-sim itself is not
+used as evidence for this client's clj-http-lite, TLS, compression, or Schannel
+behavior.
 
 | component | pin | how it enters the graph |
 | --- | --- | --- |
@@ -28,7 +27,29 @@ renamed the public monotonic clock from `jolt.host/monotonic-nanos` to
 `jolt.host/mono-nanos`; both client deadline sources now use the current name.
 No transport, TLS, compression, or Schannel compatibility shim was added.
 
-## Last fully observed stack
+### Current six-target hosted checkpoint
+
+Source revision `8f08a782c0e2b9e62ee4d9b11b04cb82f4feaf51` passed two
+independent exact-head matrices: push
+[run `30970312877`](https://github.com/casselc/http-client/actions/runs/30970312877)
+and pull-request
+[run `30970314358`](https://github.com/casselc/http-client/actions/runs/30970314358).
+
+| target | source-runtime evidence | result |
+| --- | --- | --- |
+| Linux x86_64 | full compatibility/TLS suite, libz, babashka surface, capabilities, plaintext loopback, bounded models | 85/207; 5/5; 7/11; 10/56; 18/56; 9/9 |
+| Linux aarch64 | same gates with native architecture assertion | pass in both matrices |
+| macOS x86_64 | same POSIX gates | pass in both matrices |
+| macOS arm64 | same POSIX gates with native architecture assertion | pass in both matrices |
+| Windows x86_64 | plaintext, capabilities, portable Schannel contracts, real Schannel loopback | 18/56; 10/47; 10/33; 2/11, fixture `failed,served,failed` |
+| Windows aarch64 | same gates with native `aarch64` assertion | pass in both matrices |
+
+Counts are tests/assertions except libz and model verdicts. The first candidate
+`a8c4616` is deliberately not counted: its red matrix exposed the signed-byte
+stream-contract defect fixed in `8f08a78`. The passing matrix therefore proves
+the fix rather than hiding its original failure.
+
+## Previous fully observed stack
 
 | component | pin | how it enters the graph |
 | --- | --- | --- |
@@ -216,14 +237,13 @@ Reproduction (from WSL, project staged at
 
 ## Current hosted coverage boundary
 
-The configured workflow is intended to observe source-runtime behavior on
+The current workflow observes source-runtime behavior on
 Linux x86_64/aarch64, macOS arm64/x86_64, and Windows x86_64/aarch64. The four
 POSIX rows run the full compatibility, OpenSSL, libz, capability, plaintext,
 and proof gates. Windows runs the portable plaintext/capability contracts and
-the focused Schannel contracts plus a real TLS loopback fixture. These rows do
-not become evidence for the refreshed pins until the exact candidate completes
-that hosted matrix; even then, they are source-mode evidence rather than
-packaged `joltc` or AOT-image evidence.
+the focused Schannel contracts plus a real TLS loopback fixture. This is
+source-mode evidence against the exact fork core; it is not packaged `joltc` or
+AOT-image evidence.
 
 ## Platform boundaries
 
