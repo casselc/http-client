@@ -1,20 +1,67 @@
 # W10A/W10B and shared-toolchain platform evidence
 
-What was actually run, on what, with which pins. Observed results only;
-platforms not covered by the current workflow are named as such.
+This records the current compatibility target and its exact source-runtime
+evidence separately from predecessor checkpoints. Platforms not covered by the
+current workflow are named as such.
 
-## Pinned stack
+## Current compatibility target
+
+The source and workflow target the same current Jolt core, jolt-tcp, and
+jolt-net spine already exercised by jolt-sim. The exact candidate now has its
+own six-target hosted source-runtime evidence below; jolt-sim itself is not
+used as evidence for this client's clj-http-lite, TLS, compression, or Schannel
+behavior.
 
 | component | pin | how it enters the graph |
 | --- | --- | --- |
-| Jolt core | `46e1f74fc14f29283586900ef4b98c45375c0500` | the compiler/runtime; not a dep. Every lane builds against it because the pinned jolt-net needs host/FFI primitives a released `joltc` does not carry |
-| jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` | `deps.edn` (`casselc/jolt-tcp`) |
-| jolt-net | `c3747385235df812e0d739a3e9f71c4dfb07b474` | transitively, pinned by jolt-tcp |
+| Jolt core | `9fc64f93eba8b56a319f91bb1a322e2efced9c70` | the Jolt 0.5.20 proposal compiler/runtime selected by workflow `JOLT_CORE_SHA` |
+| jolt-tcp | `0ceaa900bfca11933d35831d7697c7e2c5b22f04` | `deps.edn` (`casselc/jolt-tcp`) |
+| jolt-net | `699b908ffb4eb79ad35055cdc20866bb504e6932` | transitively pinned by jolt-tcp |
+| jolt-crypto | `c0b8237e74e4f17d2675b57bab32d4aebd92812f` | unchanged direct dependency; public CNG-capable revision |
+| clj-http-lite | `5bc2a98969b4926d090787baf9297fd73cea42d0` | unchanged direct dependency |
+
+The jolt-tcp public calls consumed here (`client/connect`, `send-all!`,
+`receive-at-most!`, `close!`; `server/run-server`, `write-completion`, `close`,
+and `stop-server`) retain their arities and contracts at the new pin. The core
+renamed the public monotonic clock from `jolt.host/monotonic-nanos` to
+`jolt.host/mono-nanos`; both client deadline sources now use the current name.
+No transport, TLS, compression, or Schannel compatibility shim was added.
+
+### Current six-target hosted checkpoint
+
+Source revision `8f08a782c0e2b9e62ee4d9b11b04cb82f4feaf51` passed two
+independent exact-head matrices: push
+[run `30970312877`](https://github.com/casselc/http-client/actions/runs/30970312877)
+and pull-request
+[run `30970314358`](https://github.com/casselc/http-client/actions/runs/30970314358).
+
+| target | source-runtime evidence | result |
+| --- | --- | --- |
+| Linux x86_64 | full compatibility/TLS suite, libz, babashka surface, capabilities, plaintext loopback, bounded models | 85/207; 5/5; 7/11; 10/56; 18/56; 9/9 |
+| Linux aarch64 | same gates with native architecture assertion | pass in both matrices |
+| macOS x86_64 | same POSIX gates | pass in both matrices |
+| macOS arm64 | same POSIX gates with native architecture assertion | pass in both matrices |
+| Windows x86_64 | plaintext, capabilities, portable Schannel contracts, real Schannel loopback | 18/56; 10/47; 10/33; 2/11, fixture `failed,served,failed` |
+| Windows aarch64 | same gates with native `aarch64` assertion | pass in both matrices |
+
+Counts are tests/assertions except libz and model verdicts. The first candidate
+`a8c4616` is deliberately not counted: its red matrix exposed the signed-byte
+stream-contract defect fixed in `8f08a78`. The passing matrix therefore proves
+the fix rather than hiding its original failure.
+
+## Previous fully observed stack
+
+| component | pin | how it enters the graph |
+| --- | --- | --- |
+| Jolt core | `46e1f74fc14f29283586900ef4b98c45375c0500` | compiler/runtime used by the recorded runs below |
+| jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` | then-current direct dependency |
+| jolt-net | `c3747385235df812e0d739a3e9f71c4dfb07b474` | transitive pin of that jolt-tcp revision |
 | jolt-crypto | `c0b8237e74e4f17d2675b57bab32d4aebd92812f` | `deps.edn` (`casselc/jolt-crypto`), public CNG-capable revision |
 | clj-http-lite | `5bc2a98969b4926d090787baf9297fd73cea42d0` | `deps.edn` (`clj-commons/clj-http-lite`) |
 
-All four dependency pins were confirmed fetchable from their public URLs, and
-were fetched at exactly these SHAs into empty caches on both platforms below.
+All four dependency pins in this historical table were confirmed fetchable
+from their public URLs, and were fetched at exactly these SHAs into empty caches
+on both platforms below.
 
 ## Observed runs
 
@@ -190,13 +237,13 @@ Reproduction (from WSL, project staged at
 
 ## Current hosted coverage boundary
 
-The current workflow observes source-runtime behavior on Linux x86_64/aarch64,
-macOS arm64/x86_64, and Windows x86_64/aarch64. The four POSIX rows run the
-full compatibility, OpenSSL, libz, capability, plaintext, and proof gates.
-Windows runs the portable plaintext/capability contracts and the focused
-Schannel contracts plus a real TLS loopback fixture. This remains source-mode
-evidence against the pinned fork core: it is not packaged `joltc` or AOT-image
-evidence.
+The current workflow observes source-runtime behavior on
+Linux x86_64/aarch64, macOS arm64/x86_64, and Windows x86_64/aarch64. The four
+POSIX rows run the full compatibility, OpenSSL, libz, capability, plaintext,
+and proof gates. Windows runs the portable plaintext/capability contracts and
+the focused Schannel contracts plus a real TLS loopback fixture. This is
+source-mode evidence against the exact fork core; it is not packaged `joltc` or
+AOT-image evidence.
 
 ## Platform boundaries
 

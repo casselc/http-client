@@ -28,7 +28,7 @@
 (def ^:private nanos-per-ms 1000000)
 
 (defn- monotonic-now []
-  (jolt.host/monotonic-nanos))
+  (jolt.host/mono-nanos))
 
 (defn- ensure-request-deadline! [opts]
   (when-let [deadline (:deadline-nanos opts)]
@@ -384,7 +384,14 @@
     {"read" (fn [self & args]
               (let [b (tget self :bytes) p (tget self :pos) n (alength b)]
                 (if (empty? args)
-                  (if (>= p n) -1 (do (tput! self :pos (inc p)) (aget b p)))
+                  ;; InputStream.read() returns an unsigned octet in 0..255 or
+                  ;; -1 at EOF even though Java/Jolt byte-array elements are
+                  ;; signed. Returning the raw element makes every high byte
+                  ;; look negative and can truncate stream-copy consumers.
+                  (if (>= p n)
+                    -1
+                    (do (tput! self :pos (inc p))
+                        (bit-and (aget b p) 0xff)))
                   (let [buf (first args)
                         off (or (second args) 0)
                         len (or (nth args 2 nil) (alength buf))]

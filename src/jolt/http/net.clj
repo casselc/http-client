@@ -29,7 +29,7 @@
   (jolt.host/throwable class (str message) cause))
 
 (defn- monotonic-now []
-  (jolt.host/monotonic-nanos))
+  (jolt.host/mono-nanos))
 
 (defn- timeout-error? [exception]
   (let [data (ex-data exception)]

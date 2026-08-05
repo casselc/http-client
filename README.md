@@ -96,13 +96,17 @@ overrun the configured budget while DNS is blocked.
   used.
 - A `jolt` build with the library-shim host hooks (`__register-class-methods!` /
   `__register-instance-check!`) and the FFI byte-buffer / charset support this
-  library relies on. The pinned `jolt-net` needs host/FFI primitives a released
-  `joltc` does not carry, so build against the core revision named in
-  `.github/workflows/tests.yml` (`JOLT_CORE_SHA`).
+  library relies on. The current dependency graph targets Jolt 0.5.20 proposal
+  core `9fc64f93eba8b56a319f91bb1a322e2efced9c70`, jolt-tcp
+  `0ceaa900bfca11933d35831d7697c7e2c5b22f04`, and its transitive jolt-net
+  `699b908ffb4eb79ad35055cdc20866bb504e6932`. The jolt-net pin needs host/FFI
+  primitives carried by that exact fork core, so use its `bin/jolt`; CI records
+  the same core as `JOLT_CORE_SHA` in `.github/workflows/tests.yml`.
 
 ## Tests
 
-`joltc -M:test` runs clj-http-lite's own `client`, `links` and `integration`
+`bin/jolt -M:test` from the pinned core runs clj-http-lite's own `client`,
+`links` and `integration`
 suites under Jolt. The suites are vendored under `test/clj_http/lite`; their
 `server-process` fixture is replaced with in-process plaintext + TLS servers
 (`jolt.http.test-server`, with a test-only listener feeding the same opaque byte
@@ -110,13 +114,14 @@ transport + OpenSSL engine) in place of the suite's Jetty subprocess — no
 external checkout needed.
 
 ```
-joltc -M:test
+path/to/pinned-jolt/bin/jolt -M:test
 ```
 
 The main suite includes deterministic transport/deadline and TLS error-ordering
 tests in addition to clj-http-lite's integration suite. Separate
-`joltc -M:bhctest` and `joltc -M:zlibtest` aliases cover babashka.http-client and
-libz.
+`path/to/pinned-jolt/bin/jolt -M:bhctest` and
+`path/to/pinned-jolt/bin/jolt -M:zlibtest` aliases cover
+babashka.http-client and libz.
 
 `-M:test`, `-M:zlibtest` and `-M:bhctest` are **POSIX lanes**: their in-process
 origin (`jolt.http.test-server`) opens its listener with raw POSIX
@@ -126,15 +131,15 @@ Two further aliases are portable and run identically on Linux, macOS and native
 Windows:
 
 ```
-joltc -M:plaintext-test   # real loopback HTTP over jolt-tcp, no TLS, no zlib
-joltc -M:capability       # provider seam: resolved providers and fail-closed refusals
+path/to/pinned-jolt/bin/jolt -M:plaintext-test # real loopback HTTP over jolt-tcp, no TLS, no zlib
+path/to/pinned-jolt/bin/jolt -M:capability     # provider seam and fail-closed refusals
 ```
 
 Schannel adds two focused aliases:
 
 ```text
-joltc -M:schannel-contract-test # portable buffer/ownership contracts
-joltc -M:schannel-runtime-test  # native Windows TLS fixture; normally run by tools/test-windows-schannel.ps1
+path/to/pinned-jolt/bin/jolt -M:schannel-contract-test # portable buffer/ownership contracts
+path/to/pinned-jolt/bin/jolt -M:schannel-runtime-test  # native Windows TLS fixture; normally run by tools/test-windows-schannel.ps1
 ```
 
 The native gate makes three ordered connections to a self-signed loopback

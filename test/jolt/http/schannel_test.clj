@@ -10,8 +10,10 @@
 (deftest target-names-are-nul-terminated-utf16le
   (let [pointer (@#'schannel/utf16-pointer "AΩ")]
     (try
-      (is (= [65 0 169 3 0 0]
-             (vec (ffi/read-array pointer 6))))
+      (let [bytes (ffi/read-array pointer 6)]
+        (is (= [65 0 -87 3 0 0] (vec bytes)))
+        (is (= [65 0 169 3 0 0]
+               (mapv #(bit-and % 0xff) bytes))))
       (finally
         (ffi/free pointer)))))
 

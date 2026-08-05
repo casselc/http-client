@@ -6,12 +6,11 @@ permissions:
   contents: read
 
 env:
-  # One reviewed fork revision for every source-mode lane. The pinned jolt-net
-  # (reached through jolt-tcp) needs host/FFI primitives a released joltc does
-  # not carry, so every lane below builds against this core rather than a
-  # published artifact. Keep it centralized so no platform can silently
-  # validate against a different core.
-  JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+  # One reviewed Jolt 0.5.20 fork revision for every source-mode lane. The
+  # pinned jolt-net (reached through jolt-tcp) needs the proposal host/FFI
+  # primitives carried by this exact core, so no lane uses a released artifact
+  # or silently validates against a different runtime.
+  JOLT_CORE_SHA: 9fc64f93eba8b56a319f91bb1a322e2efced9c70
   CHEZ_TOOLCHAIN_RELEASE: chez-ci-10.4.1.1
 
 jobs:

@@ -16,7 +16,7 @@
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
         io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "911cf783d56e988adb2b8f716b6636fae5454e52"}
+         :git/sha "0ceaa900bfca11933d35831d7697c7e2c5b22f04"}
         io.github.casselc/jolt-crypto
         {:git/url "https://github.com/casselc/jolt-crypto.git"
          :git/sha "c0b8237e74e4f17d2675b57bab32d4aebd92812f"}}
