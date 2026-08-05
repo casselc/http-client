@@ -28,7 +28,7 @@
 (def ^:private nanos-per-ms 1000000)
 
 (defn- monotonic-now []
-  (jolt.host/monotonic-nanos))
+  (jolt.host/mono-nanos))
 
 (defn- ensure-request-deadline! [opts]
   (when-let [deadline (:deadline-nanos opts)]

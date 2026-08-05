@@ -1,20 +1,46 @@
 # W10A/W10B and shared-toolchain platform evidence
 
-What was actually run, on what, with which pins. Observed results only;
-platforms not covered by the current workflow are named as such.
+This separates the current compatibility target from the runtime evidence
+already observed against its predecessor. Platforms not covered by the current
+workflow are named as such.
 
-## Pinned stack
+## Current compatibility target
+
+The source and workflow now target the same current Jolt core, jolt-tcp, and
+jolt-net spine already exercised by jolt-sim. This refresh performed static
+compatibility checks only; jolt-sim does not establish this client's
+clj-http-lite, TLS, compression, or Schannel behavior. The observed runtime
+evidence below remains attached to the prior stack until the serial local gates
+and hosted matrix pass this exact candidate.
 
 | component | pin | how it enters the graph |
 | --- | --- | --- |
-| Jolt core | `46e1f74fc14f29283586900ef4b98c45375c0500` | the compiler/runtime; not a dep. Every lane builds against it because the pinned jolt-net needs host/FFI primitives a released `joltc` does not carry |
-| jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` | `deps.edn` (`casselc/jolt-tcp`) |
-| jolt-net | `c3747385235df812e0d739a3e9f71c4dfb07b474` | transitively, pinned by jolt-tcp |
+| Jolt core | `9fc64f93eba8b56a319f91bb1a322e2efced9c70` | the Jolt 0.5.20 proposal compiler/runtime selected by workflow `JOLT_CORE_SHA` |
+| jolt-tcp | `0ceaa900bfca11933d35831d7697c7e2c5b22f04` | `deps.edn` (`casselc/jolt-tcp`) |
+| jolt-net | `699b908ffb4eb79ad35055cdc20866bb504e6932` | transitively pinned by jolt-tcp |
+| jolt-crypto | `c0b8237e74e4f17d2675b57bab32d4aebd92812f` | unchanged direct dependency; public CNG-capable revision |
+| clj-http-lite | `5bc2a98969b4926d090787baf9297fd73cea42d0` | unchanged direct dependency |
+
+The jolt-tcp public calls consumed here (`client/connect`, `send-all!`,
+`receive-at-most!`, `close!`; `server/run-server`, `write-completion`, `close`,
+and `stop-server`) retain their arities and contracts at the new pin. The core
+renamed the public monotonic clock from `jolt.host/monotonic-nanos` to
+`jolt.host/mono-nanos`; both client deadline sources now use the current name.
+No transport, TLS, compression, or Schannel compatibility shim was added.
+
+## Last fully observed stack
+
+| component | pin | how it enters the graph |
+| --- | --- | --- |
+| Jolt core | `46e1f74fc14f29283586900ef4b98c45375c0500` | compiler/runtime used by the recorded runs below |
+| jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` | then-current direct dependency |
+| jolt-net | `c3747385235df812e0d739a3e9f71c4dfb07b474` | transitive pin of that jolt-tcp revision |
 | jolt-crypto | `c0b8237e74e4f17d2675b57bab32d4aebd92812f` | `deps.edn` (`casselc/jolt-crypto`), public CNG-capable revision |
 | clj-http-lite | `5bc2a98969b4926d090787baf9297fd73cea42d0` | `deps.edn` (`clj-commons/clj-http-lite`) |
 
-All four dependency pins were confirmed fetchable from their public URLs, and
-were fetched at exactly these SHAs into empty caches on both platforms below.
+All four dependency pins in this historical table were confirmed fetchable
+from their public URLs, and were fetched at exactly these SHAs into empty caches
+on both platforms below.
 
 ## Observed runs
 
@@ -190,13 +216,14 @@ Reproduction (from WSL, project staged at
 
 ## Current hosted coverage boundary
 
-The current workflow observes source-runtime behavior on Linux x86_64/aarch64,
-macOS arm64/x86_64, and Windows x86_64/aarch64. The four POSIX rows run the
-full compatibility, OpenSSL, libz, capability, plaintext, and proof gates.
-Windows runs the portable plaintext/capability contracts and the focused
-Schannel contracts plus a real TLS loopback fixture. This remains source-mode
-evidence against the pinned fork core: it is not packaged `joltc` or AOT-image
-evidence.
+The configured workflow is intended to observe source-runtime behavior on
+Linux x86_64/aarch64, macOS arm64/x86_64, and Windows x86_64/aarch64. The four
+POSIX rows run the full compatibility, OpenSSL, libz, capability, plaintext,
+and proof gates. Windows runs the portable plaintext/capability contracts and
+the focused Schannel contracts plus a real TLS loopback fixture. These rows do
+not become evidence for the refreshed pins until the exact candidate completes
+that hosted matrix; even then, they are source-mode evidence rather than
+packaged `joltc` or AOT-image evidence.
 
 ## Platform boundaries
 
