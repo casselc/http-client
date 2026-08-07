@@ -67,30 +67,45 @@
   (let [flags (c-fcntl-get fd f-getfl)]
     (when (neg? flags)
       (conn-ex "java.io.IOException" "fcntl F_GETFL failed"))
-    (c-fcntl-set fd f-setfl (if nonblocking? (bit-or flags o-nonblock) (bit-and-not flags o-nonblock)))
+    ;; An unchecked F_SETFL is the one failure that hides itself: the socket
+    ;; stays blocking, connect() parks for the kernel's SYN window, and the
+    ;; timeout the caller asked for silently does nothing.
+    (when (neg? (c-fcntl-set fd f-setfl (if nonblocking?
+                                          (bit-or flags o-nonblock)
+                                          (bit-and-not flags o-nonblock))))
+      (conn-ex "java.io.IOException" "fcntl F_SETFL failed"))
     nil))
 
 (defn- socket-error [fd]
   ;; SO_ERROR for a socket poll() reported writable: 0 means the connect
-  ;; completed, anything else is the errno of the failed connect.
+  ;; completed, anything else is the errno of the failed connect. getsockopt
+  ;; leaves the buffer untouched when it fails, so a fresh allocation would read
+  ;; back as whatever was in that memory — zero it and report a failed getsockopt
+  ;; as an error rather than risk calling a dead socket connected.
   (let [err (ffi/alloc 4) len (ffi/alloc 4)]
     (try
+      (ffi/write err :int 0 0)
       (ffi/write len :uint 0 4)
-      (c-getsockopt fd sol-socket so-error err len)
-      (ffi/read err :int)
+      (if (neg? (c-getsockopt fd sol-socket so-error err len))
+        -1
+        (ffi/read err :int))
       (finally (ffi/free err) (ffi/free len)))))
 
-;; Return 0 when the connection is established, a nonzero error code when it
-;; failed outright (caller closes the fd and tries the next address), or throw a
-;; ConnectException when the timeout elapsed. connect() on a non-blocking socket
-;; returns -1 (EINPROGRESS) instead of blocking; poll then waits on it and
-;; SO_ERROR reports the outcome.
-(defn- timed-connect [host port fd addr addrlen timeout-ms]
+;; Return 0 when the connection is established, :timeout when the poll deadline
+;; elapsed, or a nonzero error code when the connect failed outright. All three
+;; non-success outcomes mean only "this address did not work" — the caller closes
+;; the fd and moves to the next one. connect() on a non-blocking socket returns
+;; -1 (EINPROGRESS) instead of blocking; poll then waits on it and SO_ERROR
+;; reports the outcome.
+(defn- timed-connect [fd addr addrlen timeout-ms]
   (if (zero? (c-connect fd addr addrlen))
     0
     (let [pf (ffi/alloc 8)]
       (try
         ;; struct pollfd { int fd; short events; short revents; } — 8 bytes LP64.
+        ;; jolt.ffi has no 16-bit type, so events and revents are set by one :int
+        ;; write: little-endian puts events in the low half, revents (already
+        ;; zeroed) in the high half.
         (dotimes [i 8] (ffi/write pf :uint8 i 0))
         (ffi/write pf :int 0 fd)
         (ffi/write pf :int 4 po-pollout)
@@ -98,23 +113,29 @@
           (cond
             ;; writable — the connect either completed or failed; SO_ERROR tells.
             (pos? pr) (socket-error fd)
-            (zero? pr) (conn-ex "java.net.ConnectException"
-                                (str "connect timed out: " host ":" port))
+            (zero? pr) :timeout
             :else (conn-ex "java.io.IOException" "poll failed")))
         (finally (ffi/free pf))))))
 
-(defn- attempt-connect [host port fd addr addrlen timeout-ms]
+(defn- attempt-connect [fd addr addrlen timeout-ms]
   (if (and timeout-ms (pos? timeout-ms))
     (do (set-nonblock! fd true)
-        (try (timed-connect host port fd addr addrlen timeout-ms)
-             (finally (set-nonblock! fd false))))
+        (let [rc (timed-connect fd addr addrlen timeout-ms)]
+          ;; Restore blocking only for the fd we are handing back: recv/send and
+          ;; SO_RCVTIMEO downstream all assume a blocking socket. On any failure
+          ;; the caller closes it, so there is nothing to restore, and skipping
+          ;; the restore keeps a failing fcntl from masking the real error.
+          (when (= 0 rc) (set-nonblock! fd false))
+          rc))
     (c-connect fd addr addrlen)))
 
 (defn connect
   "Resolve host:port and open a connected TCP socket; return its fd. `timeout-ms`,
-  when positive, bounds the connect with a non-blocking connect + poll — without
-  it, a blocked connect is bounded only by the kernel's SYN retry limit. Throws a
-  java.net.UnknownHostException / ConnectException-tagged throwable on failure."
+  when positive, bounds each connect attempt with a non-blocking connect + poll —
+  without it, a blocked connect is bounded only by the kernel's SYN retry limit.
+  The bound is per address, as java.net.Socket's is: a host resolving to both a
+  dead and a live address still connects. Throws a java.net.UnknownHostException
+  / ConnectException-tagged throwable on failure."
   ([host port] (connect host port nil))
   ([host port timeout-ms]
    (let [node    (ffi/string->ptr (str host))
@@ -131,9 +152,18 @@
            (conn-ex "java.net.UnknownHostException" (str host)))
          (let [res (ffi/read respp :pointer)]
            (try
-             (loop [ai res]
+             ;; Walk every address getaddrinfo returned. A timeout retires only
+             ;; the address it happened on — a name whose AAAA blackholes and
+             ;; whose A answers is the ordinary shape of a broken-IPv6 network,
+             ;; and giving up on the host there would make :conn-timeout turn a
+             ;; working request into a failing one. `timed-out?` only decides
+             ;; which message the exhausted walk reports.
+             (loop [ai res timed-out? false]
                (if (ffi/null? ai)
-                 (conn-ex "java.net.ConnectException" (str "connection refused: " host ":" port))
+                 (conn-ex "java.net.ConnectException"
+                          (if timed-out?
+                            (str "connect timed out: " host ":" port)
+                            (str "connection refused: " host ":" port)))
                  (let [fam     (ffi/read ai :int O-ai-family)
                        sockt   (ffi/read ai :int O-ai-socktype)
                        proto   (ffi/read ai :int O-ai-protocol)
@@ -141,11 +171,14 @@
                        addr    (ffi/read ai :pointer O-ai-addr)
                        fd      (c-socket fam sockt proto)]
                    (cond
-                     (neg? fd) (recur (ffi/read ai :pointer O-ai-next))
+                     (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out?)
                      :else (try
-                             (if (zero? (attempt-connect host port fd addr addrlen timeout-ms))
-                               fd
-                               (do (c-close fd) (recur (ffi/read ai :pointer O-ai-next))))
+                             (let [rc (attempt-connect fd addr addrlen timeout-ms)]
+                               (if (= 0 rc)
+                                 fd
+                                 (do (c-close fd)
+                                     (recur (ffi/read ai :pointer O-ai-next)
+                                            (or timed-out? (= :timeout rc))))))
                              (catch Throwable t (c-close fd) (throw t)))))))
              (finally (c-freeaddrinfo res)))))
        (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints))))))

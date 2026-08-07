@@ -184,3 +184,19 @@
     (is (= :threw outcome) "a blackholed address must fail rather than return")
     (is (< elapsed 10000)
         (str "connect must give up near the 500ms timeout, took " elapsed "ms"))))
+
+;; getaddrinfo hands back every address for a name and connect walks them until
+;; one answers. "localhost" resolves to ::1 and 127.0.0.1 on both macOS and the
+;; CI runners, usually ::1 first, and the test server binds AF_INET only — so
+;; the first address is refused and the request only works if the walk continues
+;; to the second. Setting :conn-timeout puts that walk on the non-blocking
+;; connect + poll path, which is the part that has to keep the loop going: a
+;; per-address failure means "try the next one", never "give up on the host".
+(deftest conn-timeout-still-walks-every-address
+  (let [port 18447
+        srv (srv/start-plain port)]
+    (try
+      (is (= 200 (:status (http/get (str "http://localhost:" port "/get")
+                                    {:conn-timeout 2000 :socket-timeout 5000})))
+          "a refused first address must not abort the whole connect")
+      (finally (srv/stop srv)))))
