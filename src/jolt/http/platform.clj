@@ -115,10 +115,10 @@
 (defn- s-close [stream] (if (table? stream) ((tget stream :close)) (net/close stream)))
 
 ;; --- HTTP/1.1 client -------------------------------------------------------
-(defn- connect-stream [host port https? insecure? read-timeout]
+(defn- connect-stream [host port https? insecure? read-timeout conn-timeout]
   (if https?
-    (tls/tls-connect host port insecure? read-timeout)
-    (let [fd (net/connect (str host) port)]
+    (tls/tls-connect host port insecure? read-timeout conn-timeout)
+    (let [fd (net/connect (str host) port conn-timeout)]
       (net/set-read-timeout! fd read-timeout)
       fd)))
 
@@ -244,7 +244,8 @@
     (let [https? (= "https" (tget url :protocol))
           body (when (and (tget conn :do-output) (tget conn :out-buffer)) (tget conn :out-buffer))
           stream (connect-stream (tget url :host) (effective-port url) https?
-                                 (tget conn :insecure) (tget conn :read-timeout))
+                                 (tget conn :insecure) (tget conn :read-timeout)
+                                 (tget conn :connect-timeout))
           resp (try
                  (s-write stream (build-request method url (tget conn :req-headers) body))
                  (parse-response (recv-all stream))
@@ -266,13 +267,13 @@
 ;; Perform a java.net.http request synchronously over the same socket/TLS layer
 ;; clj-http-lite uses, returning a :jolt.http/response. This is what wires the
 ;; java.net.http shim's send/sendAsync to a real request.
-(defn- net-http-send [request handler]
+(defn- net-http-send [request handler conn-timeout]
   (let [url     (parse-url (str (tget request :uri)))
         method  (or (tget request :method) "GET")
         headers (or (tget request :headers) [])
         body    (when-let [bp (tget request :body)] (tget bp :bytes))
         https?  (= "https" (tget url :protocol))
-        stream  (connect-stream (tget url :host) (effective-port url) https? false 30000)
+        stream  (connect-stream (tget url :host) (effective-port url) https? false 30000 conn-timeout)
         resp    (try
                   (s-write stream (build-request method url headers body))
                   (parse-response (recv-all stream))
@@ -296,6 +297,15 @@
 ;; already holds a value or an error. thenApply/exceptionally apply immediately.
 (defn- settled-future [value error]
   (doto (tt :jolt.http/future) (tput! :value value) (tput! :error error)))
+
+;; java.net.http stores the connect timeout as a java.time.Duration; the socket
+;; layer wants milliseconds. Fall back to nil (no timeout) if it isn't a number
+;; and has no .toMillis (e.g. an unknown shim shape).
+(defn- duration-ms [d]
+  (cond
+    (nil? d) nil
+    (number? d) d
+    :else (try (.toMillis d) (catch Throwable _ nil))))
 
 (defn- open-connection [url]
   (let [c (tt :jolt/http-url-connection)]
@@ -499,10 +509,11 @@
      ;; the same request and hands back an already-settled future (thenApply /
      ;; exceptionally apply at once) — enough for the cognitect aws-api flow, which
      ;; does (.sendAsync client req handler) then .thenApply/.exceptionally.
-     "send"            (fn [self req handler] (net-http-send req handler))
-     "sendAsync"       (fn [self req handler]
-                         (try (settled-future (net-http-send req handler) nil)
-                              (catch Throwable e (settled-future nil e))))})
+      "send"            (fn [self req handler]
+                          (net-http-send req handler (duration-ms (tget self :connect-timeout))))
+      "sendAsync"       (fn [self req handler]
+                          (try (settled-future (net-http-send req handler (duration-ms (tget self :connect-timeout))) nil)
+                               (catch Throwable e (settled-future nil e))))})
   (__register-class-methods! :jolt.http/future
     {"thenApply"     (fn [self f] (if (tget self :error) self
                                     (settled-future (.apply f (tget self :value)) nil)))

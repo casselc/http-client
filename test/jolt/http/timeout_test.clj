@@ -166,3 +166,21 @@
       (platform/set-max-response-ms! nil)
       (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")))))
       (finally (srv/stop srv)))))
+
+;; --- :conn-timeout bounds the connect itself ---------------------------------
+;; A connect to a blackholed address hangs in kernel SYN retries (~75s on macOS,
+;; ~130s on Linux) with no read timeout able to interrupt it. 10.255.255.1 is
+;; silently dropped by typical gateways, so before the fix this request parked
+;; the thread for minutes; with :conn-timeout the non-blocking connect + poll
+;; must give up in about the requested time and surface as a ConnectException.
+(deftest conn-timeout-bounds-connect
+  (let [t0 (System/currentTimeMillis)
+        outcome (try
+                  (http/get "http://10.255.255.1:81/" {:conn-timeout 500
+                                                        :socket-timeout 1000})
+                  :ok
+                  (catch Throwable _ :threw))
+        elapsed (- (System/currentTimeMillis) t0)]
+    (is (= :threw outcome) "a blackholed address must fail rather than return")
+    (is (< elapsed 10000)
+        (str "connect must give up near the 500ms timeout, took " elapsed "ms"))))

@@ -200,9 +200,11 @@
   milliseconds, bounds every recv on the underlying socket — both the handshake
   and the ciphertext reads that back SSL_read — so a peer that accepts the
   connection and then goes silent surfaces as a SocketTimeoutException rather
-  than parking the calling thread forever."
-  ([host port insecure?] (tls-connect host port insecure? nil))
-  ([host port insecure? read-timeout]
+  than parking the calling thread forever. conn-timeout, in milliseconds, bounds
+  the connect itself."
+  ([host port insecure?] (tls-connect host port insecure? nil nil))
+  ([host port insecure? read-timeout] (tls-connect host port insecure? read-timeout nil))
+  ([host port insecure? read-timeout conn-timeout]
   (let [ctx (c-SSL-CTX-new (c-TLS-client-method))]
     (when (ffi/null? ctx) (throw (ssl-ex "SSL_CTX_new failed")))
     (if insecure?
@@ -218,7 +220,7 @@
       (c-SSL-set-connect ssl)
       (c-SSL-ctrl ssl SET-TLSEXT-HOSTNAME NAMETYPE-host-name host-buf)  ; SNI
       (when-not insecure? (c-SSL-set1-host ssl host-buf))
-      (let [sock (net/connect host port)
+      (let [sock (net/connect host port conn-timeout)
             _    (net/set-read-timeout! sock read-timeout)
             st   (make-stream sock ssl ctx rbio wbio)]
         (try (handshake! st true)
