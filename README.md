@@ -59,6 +59,13 @@ applies process-wide, and is nil (uncapped) by default.
 - jolt 0.6.8 or newer. `jolt.http.net` binds `fcntl` through jolt.ffi's
   `:varargs` marker, which landed in 0.6.8; older builds fail at namespace load
   with `unknown foreign type :varargs`.
+- jolt 0.7.19 or newer is worth having but not required. Below it, this library
+  registers its own `ByteArrayInputStream`/`ByteArrayOutputStream` shims, and
+  because a constructor registration is process-wide your app gets them for
+  every byte stream it builds, HTTP-related or not — draining 1 MB through one
+  measured ~1100 ns/byte against ~0.3 for jolt's own. From 0.7.19 jolt models
+  those classes with the whole surface the shims provide, so this library uses
+  jolt's and registers nothing. Both paths are tested in CI.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests

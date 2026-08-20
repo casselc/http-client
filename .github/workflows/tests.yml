@@ -1,16 +1,36 @@
 name: tests
 on: [push, pull_request]
-# The jolt this library needs, not whatever the latest release happens to be.
-# jolt.http.net binds fcntl through the :varargs marker, which landed in 0.6.8;
-# an unpinned install picked up 0.6.7 and the whole suite died at namespace load
-# with "unknown foreign type :varargs". Raise this when a namespace starts using
-# a newer jolt feature.
-env:
-  JOLT_VERSION: '0.6.8'
+# Two pinned jolts, not whatever the latest release happens to be, because this
+# library takes a DIFFERENT CODE PATH on each and both ship to users.
+#
+#   floor  - the oldest jolt supported. jolt.http.net binds fcntl through the
+#            :varargs marker, which landed in 0.6.8; an unpinned install picked
+#            up 0.6.7 and the whole suite died at namespace load with "unknown
+#            foreign type :varargs". Raise this when a namespace starts using a
+#            newer jolt feature.
+#   host   - a jolt whose own java.io byte streams answer the full surface
+#            (readNBytes/transferTo/mark landed in 0.7.19). There
+#            jolt.http.platform stops registering its shims over
+#            ByteArrayInputStream/ByteArrayOutputStream and hands back jolt's
+#            classes instead. Testing only the floor left that path — the one
+#            most users are now on — never exercised.
+#
+# Raise `host` as new jolt releases land; keep `floor` until the floor moves.
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jolt: '0.6.8'
+            path: floor (shim byte streams)
+          - jolt: '0.7.19'
+            path: host byte streams
+    name: test (jolt ${{ matrix.jolt }} - ${{ matrix.path }})
+    env:
+      JOLT_VERSION: ${{ matrix.jolt }}
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
