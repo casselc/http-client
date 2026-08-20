@@ -345,6 +345,61 @@
                         (dotimes [i avail] (aset buf (+ off i) (aget b (+ p i))))
                         (tput! self :pos (+ p avail))
                         avail))))))
+     ;; The rest of the InputStream surface. Registering the ctor for
+     ;; "ByteArrayInputStream"/"java.io.ByteArrayInputStream" replaces jolt's
+     ;; native stream PROCESS-WIDE, so every (ByteArrayInputStream. …) in an app
+     ;; that merely requires this library lands here — including ones that have
+     ;; nothing to do with HTTP. Anything this table omits then reports as
+     ;; "No matching field found: readAllBytes for class :object" (a 0-arg miss
+     ;; reads as a field probe, and a tagged table has no modelled class), which
+     ;; looks like a jolt reflection limitation and is not one. So the shim owes
+     ;; the whole surface, not just what the client itself calls.
+     "readAllBytes" (fn [self]
+                      (let [b (tget self :bytes) p (tget self :pos) n (alength b)
+                            out (byte-array (max 0 (- n p)))]
+                        (dotimes [i (- n p)] (aset out i (aget b (+ p i))))
+                        (tput! self :pos n)
+                        out))
+     ;; readNBytes reads UP TO n bytes and returns what it got (never -1, and an
+     ;; empty array at EOF); a negative n is an IllegalArgumentException.
+     "readNBytes" (fn [self & args]
+                    (if (= 1 (count args))
+                      (let [want (first args)]
+                        (when (neg? want)
+                          (throw (IllegalArgumentException. "len < 0")))
+                        (let [b (tget self :bytes) p (tget self :pos) n (alength b)
+                              take-n (min want (- n p))
+                              out (byte-array (max 0 take-n))]
+                          (dotimes [i take-n] (aset out i (aget b (+ p i))))
+                          (tput! self :pos (+ p take-n))
+                          out))
+                      ;; readNBytes(buf, off, len) returns the count, 0 at EOF
+                      (let [[buf off len] args
+                            b (tget self :bytes) p (tget self :pos) n (alength b)
+                            take-n (max 0 (min len (- n p)))]
+                        (dotimes [i take-n] (aset buf (+ off i) (aget b (+ p i))))
+                        (tput! self :pos (+ p take-n))
+                        take-n)))
+     ;; transferTo writes the remainder to dst and returns the count as a long.
+     "transferTo" (fn [self dst]
+                    (let [b (tget self :bytes) p (tget self :pos) n (alength b)
+                          cnt (- n p)
+                          out (byte-array (max 0 cnt))]
+                      (dotimes [i cnt] (aset out i (aget b (+ p i))))
+                      (tput! self :pos n)
+                      (when (pos? cnt) (.write dst out 0 cnt))
+                      cnt))
+     ;; skip never goes past the end and never negative, like the reference.
+     "skip" (fn [self k]
+              (let [b (tget self :bytes) p (tget self :pos) n (alength b)
+                    d (max 0 (min k (- n p)))]
+                (tput! self :pos (+ p d))
+                d))
+     ;; mark/reset are supported on a ByteArrayInputStream; mark's readlimit is
+     ;; ignored there, and reset with no mark returns to the initial position.
+     "markSupported" (fn [self] true)
+     "mark" (fn [self & _] (tput! self :mark (tget self :pos)) nil)
+     "reset" (fn [self & _] (tput! self :pos (or (tget self :mark) 0)) nil)
      "available" (fn [self] (- (alength (tget self :bytes)) (tget self :pos)))
      "close" (fn [self & _] nil)})
   (__register-class-methods! :jolt/baos
