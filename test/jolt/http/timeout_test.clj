@@ -200,3 +200,60 @@
                                     {:conn-timeout 2000 :socket-timeout 5000})))
           "a refused first address must not abort the whole connect")
       (finally (srv/stop srv)))))
+
+;; --- a peer that resets: recv must not masquerade as a timeout ---------------
+;; recv-bytes mapped EVERY negative recv to SocketTimeoutException("Read timed
+;; out"). A peer that closes without reading what the client sent makes the
+;; kernel answer the next recv with ECONNRESET, and reporting that as a read
+;; timeout — with no timeout configured — is exactly what the self-signed-ssl-get
+;; flake printed: "expected throw of javax.net.ssl.SSLException but got
+;; java.net.SocketTimeoutException". The message misdirects debugging to
+;; SO_RCVTIMEO, which was never set.
+
+(defn- start-resetting-server [port]
+  (let [fd (srv/listen-socket port)
+        running? (atom true)]
+    (future
+      (loop []
+        (let [raw (srv/accept-raw fd)]
+          (when @running?
+            (when-not (neg? raw)
+              ;; give the client's bytes time to queue, then close UNREAD: the
+              ;; close carries pending inbound data, so the kernel sends RST
+              (future (try (Thread/sleep 100) (net/close raw) (catch Throwable _ nil))))
+            (recur)))))
+    {:fd fd :running running?}))
+
+(deftest recv-classifies-reset-not-timeout
+  (let [port 18448
+        srv (start-resetting-server port)]
+    (try
+      (let [fd (net/connect "127.0.0.1" port nil)]
+        (net/send-bytes fd (.getBytes "hello"))
+        (let [e (try (net/recv-bytes fd) nil (catch Throwable e e))]
+          (is (some? e) "a reset connection must throw, not return")
+          (is (str/includes? (str (class e)) "SocketException")
+              (str "ECONNRESET is a socket error, got " (class e)))
+          (is (re-find #"[Rr]eset" (or (ex-message e) ""))
+              (str "message must name the reset, got " (pr-str (ex-message e))))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+(deftest tls-handshake-transport-failure-is-ssl-exception
+  ;; JVM parity: a transport failure during the TLS handshake surfaces as
+  ;; SSLException, the way javax.net.ssl reports "Remote host terminated the
+  ;; handshake". The raw SocketTimeoutException/SocketException of the transport
+  ;; used to escape tls-connect untouched, so a mid-handshake reset read as a
+  ;; read timeout to every caller — including clj-http-lite's
+  ;; (is (thrown? SSLException ...)) in self-signed-ssl-get.
+  (let [port 18449
+        srv (start-resetting-server port)]
+    (try
+      (let [e (try (tls/tls-connect "127.0.0.1" port false) nil
+                   (catch Throwable e e))]
+        (is (some? e))
+        (is (str/includes? (str (class e)) "SSLException")
+            (str "a transport failure inside the handshake is an SSLException, got "
+                 (class e)))
+        (is (not (str/includes? (str (class e)) "SocketTimeoutException"))
+            "the transport's own exception class must not leak through"))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
