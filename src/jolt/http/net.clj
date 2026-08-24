@@ -7,6 +7,7 @@
   resolve at load. accept/recv/send/connect/getaddrinfo are marked :blocking so a
   parked socket call never pins jolt's stop-the-world collector."
   (:require [jolt.ffi :as ffi]
+            [jolt.io-poller :as poller]
             [clojure.string :as str]))
 
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
@@ -197,17 +198,43 @@
 
 (def ^:private bufsize 65536)
 
+;; errno values differ per platform: EINTR is 4 on both; EAGAIN 35/11,
+;; ECONNRESET 54/104, EPIPE 32/32 (macOS/Linux).
+(def ^:private eintr 4)
+(def ^:private eagain (if macos? 35 11))
+(def ^:private econnreset (if macos? 54 104))
+(def ^:private epipe 32)
+
+(defn- recv-err-ex
+  "The exception a negative recv deserves, classed by what actually failed:
+  EAGAIN is the SO_RCVTIMEO firing (SocketTimeoutException), ECONNRESET/EPIPE
+  are the peer tearing the connection down mid-flight (SocketException, like
+  java.net). Reported before by every failure alike as \"Read timed out\",
+  which sent anyone debugging a reset connection chasing a timeout that was
+  never set — that misdirection is what self-signed-ssl-get's flake printed."
+  [err]
+  (cond
+    (= err eagain)      (conn-ex "java.net.SocketTimeoutException" "Read timed out")
+    (= err econnreset)  (conn-ex "java.net.SocketException" "Connection reset")
+    (= err epipe)       (conn-ex "java.net.SocketException" "Broken pipe")
+    :else               (conn-ex "java.net.SocketException"
+                                  (str "recv failed (errno " err ")"))))
+
 (defn recv-bytes
   "Read up to one bufferful from `fd`: a byte-array, nil at EOF (recv 0), or a
-  thrown SocketTimeoutException if a read timeout (SO_RCVTIMEO) elapsed (recv -1)."
+  thrown exception classed by errno (see recv-err-ex)."
   [fd]
   (let [buf (ffi/alloc bufsize)]
     (try
-      (let [got (c-recv fd buf bufsize 0)]
-        (cond
-          (pos? got) (ffi/read-array buf got)
-          (zero? got) nil
-          :else (conn-ex "java.net.SocketTimeoutException" "Read timed out")))
+      (loop []
+        (let [got (c-recv fd buf bufsize 0)
+              err (when (neg? got) (poller/errno))]
+          (cond
+            (pos? got) (ffi/read-array buf got)
+            (zero? got) nil
+            ;; a signal is not the peer going away; the read is simply owed again
+            (= err eintr) (recur)
+            :else (throw (recv-err-ex err)))))
       (finally (ffi/free buf)))))
 
 (defn send-bytes
@@ -219,10 +246,14 @@
       (ffi/write-array buf data)
       (loop [off 0]
         (when (< off n)
-          (let [sent (c-send fd (+ buf off) (- n off) 0)]
-            (if (pos? sent)
-              (recur (+ off sent))
-              (conn-ex "java.io.IOException" "send failed")))))
+          (let [sent (c-send fd (+ buf off) (- n off) 0)
+                err (when (neg? sent) (poller/errno))]
+            (cond
+              (pos? sent) (recur (+ off sent))
+              (= err eintr) (recur off)
+              (= err econnreset) (conn-ex "java.net.SocketException" "Connection reset")
+              (= err epipe) (conn-ex "java.net.SocketException" "Broken pipe")
+              :else (conn-ex "java.io.IOException" (str "send failed (errno " err ")"))))))
       (finally (ffi/free buf)))))
 
 (defn close [fd] (c-close fd) nil)

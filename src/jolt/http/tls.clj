@@ -96,12 +96,14 @@
 (ffi/defcfn c-BIO-write         "BIO_write"         [:pointer :pointer :int] :int)
 (ffi/defcfn c-BIO-ctrl          "BIO_ctrl"          [:pointer :int :int64 :pointer] :int64)
 
-(defn- ssl-ex [msg]
-  (let [t (jolt.host/tagged-table :jolt/ex-info)]
-    (jolt.host/ref-put! t :class "javax.net.ssl.SSLException")
-    (jolt.host/ref-put! t :message (str msg))
-    (jolt.host/ref-put! t :data {})
-    t))
+(defn- ssl-ex
+  "A typed SSLException carrying a real message. Built through
+   jolt.host/throwable — the same path jolt.http.net's conn-ex uses — because a
+   raw :jolt/ex-info tagged table throws fine but never wires :message into
+   ex-message/.getMessage, so every TLS failure surfaced as a bare
+   #object[javax.net.ssl.SSLException] with nil cause, hiding the actual error."
+  [msg]
+  (jolt.host/throwable "javax.net.ssl.SSLException" (str msg)))
 
 ;; A NUL-terminated C-string pointer; the caller frees it.
 (defn- cstr [s] (ffi/string->ptr (str s)))
@@ -133,18 +135,35 @@
       false)))
 
 (defn- handshake! [st connect?]
-  (loop []
-    (let [ret (if connect? (c-SSL-connect (jolt.host/ref-get st :ssl))
-                  (c-SSL-accept (jolt.host/ref-get st :ssl)))]
-      (flush-out st)
-      (when-not (= ret 1)
-        (let [err (c-SSL-get-error (jolt.host/ref-get st :ssl) ret)]
-          (cond
-            (= err WANT-READ) (do (when-not (feed-in st)
-                                    (throw (ssl-ex "connection closed during TLS handshake")))
-                                  (recur))
-            (= err WANT-WRITE) (recur)
-            :else (throw (ssl-ex (str "TLS handshake failed (SSL_get_error=" err ")")))))))))
+  ;; A transport failure inside the handshake (reset, timeout, EOF from
+  ;; feed-in/flush-out) surfaces as SSLException — the way javax.net.ssl wraps
+  ;; "Remote host terminated the handshake". Letting the transport's own
+  ;; SocketException/SocketTimeoutException escape told callers a read timed
+  ;; out on a socket that never had a timeout, which is exactly the
+  ;; misdirection self-signed-ssl-get's flake printed. The transport classes
+  ;; still surface from the data phase (:read/:write), where java.net would
+  ;; report them too.
+  (letfn [(drive! []
+            (loop []
+              (let [ret (if connect? (c-SSL-connect (jolt.host/ref-get st :ssl))
+                          (c-SSL-accept (jolt.host/ref-get st :ssl)))]
+                (flush-out st)
+                (when-not (= ret 1)
+                  (let [err (c-SSL-get-error (jolt.host/ref-get st :ssl) ret)]
+                    (cond
+                      (= err WANT-READ) (do (when-not (feed-in st)
+                                              (throw (ssl-ex "connection closed during TLS handshake")))
+                                            (recur))
+                      (= err WANT-WRITE) (recur)
+                      :else (throw (ssl-ex (str "TLS handshake failed (SSL_get_error=" err ")")))))))))]
+    (try
+      (drive!)
+      (catch Throwable e
+        ;; (str (class e)) carries a leading "class ", so match with it — without
+        ;; it no transport exception ever matched and all rethrew unwrapped.
+        (if (str/starts-with? (str (class e)) "class java.net.")
+          (throw (ssl-ex (str (ex-message e) " during TLS handshake")))
+          (throw e))))))
 
 (defn- make-stream [sock ssl ctx rbio wbio]
   (let [st (jolt.host/tagged-table :jolt/tls-stream)]
