@@ -13,6 +13,9 @@
 (ffi/defcfn c-listen     "listen"     [:int :int] :int)
 (ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-close      "close"      [:int] :int)
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
@@ -20,6 +23,13 @@
   (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
 (def ^:private sol-socket (if macos? 0xffff 1))
 (def ^:private so-reuse   (if macos? 4 2))
+(def ^:private so-nosigpipe 0x1022)
+(def ^:private msg-nosignal (if macos? 0 0x4000))
+(def ^:private io-bufsize 65536)
+
+(defn- raw-close [fd]
+  (c-close fd)
+  nil)
 
 (defn- make-sockaddr [port]
   (let [sa (ffi/alloc 16)]
@@ -41,21 +51,66 @@
       (ffi/free opt))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16))
-        (net/close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
+        (raw-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
       (ffi/free sa))
-    (when (neg? (c-listen fd 64)) (net/close fd) (throw (ex-info "listen() failed" {})))
+    (when (neg? (c-listen fd 64)) (raw-close fd) (throw (ex-info "listen() failed" {})))
     fd))
 
-(defn accept-raw
-  "Block until a connection arrives on `listen-fd`; return the raw fd. Exposed so
-  a test can drive its own accept loop (e.g. a server that answers the handshake
-  and then deliberately never replies)."
-  [listen-fd]
-  (c-accept listen-fd ffi/null ffi/null))
+;; The listener is intentionally test-only raw FFI. Accepted descriptors are
+;; immediately hidden behind the same callback transport TLS consumes, so no
+;; descriptor enters production jolt.http.net or jolt.http.tls.
+(defn- configure-accepted! [fd]
+  (when macos?
+    (let [opt (ffi/alloc 4)]
+      (try
+        (ffi/write opt :int 0 1)
+        (c-setsockopt fd sol-socket so-nosigpipe opt 4)
+        (finally (ffi/free opt)))))
+  fd)
 
-;; --- connection read/write (plain fd or TLS stream) ------------------------
-(defn- conn-read [conn] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :read) conn nil) (net/recv-bytes conn)))
-(defn- conn-write [conn data] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :write) conn data) (net/send-bytes conn data)))
+(defn- raw-receive [fd]
+  (let [buf (ffi/alloc io-bufsize)]
+    (try
+      (let [n (c-recv fd buf io-bufsize 0)]
+        (cond
+          (pos? n) (ffi/read-array buf n)
+          (zero? n) nil
+          :else (throw (ex-info "test server recv failed" {:fd fd}))))
+      (finally (ffi/free buf)))))
+
+(defn- raw-send [fd data]
+  (let [n (alength data)
+        buf (ffi/alloc (max 1 n))]
+    (try
+      (ffi/write-array buf data)
+      (loop [off 0]
+        (when (< off n)
+          (let [sent (c-send fd (+ buf off) (- n off) msg-nosignal)]
+            (if (pos? sent)
+              (recur (+ off sent))
+              (throw (ex-info "test server send failed" {:fd fd}))))))
+      (finally (ffi/free buf)))))
+
+(defn- raw-transport [fd]
+  (configure-accepted! fd)
+  (net/callback-transport
+    {:send-fn (fn [data _opts] (raw-send fd data))
+     :receive-fn (fn [_opts] (raw-receive fd))
+     :close-fn #(raw-close fd)}))
+
+(defn accept-transport
+  "Accept one client and return the descriptor-free transport used by tests."
+  [listen-fd]
+  (let [raw (c-accept listen-fd ffi/null ffi/null)]
+    (when-not (neg? raw)
+      (raw-transport raw))))
+
+(defn close-listener! [listen-fd]
+  (raw-close listen-fd))
+
+;; --- connection read/write (plain transport or TLS stream) -----------------
+(defn- conn-read [conn] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :read) conn {}) (net/recv-bytes conn)))
+(defn- conn-write [conn data] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :write) conn data {}) (net/send-bytes conn data)))
 (defn- conn-close [conn] (if (jolt.host/table? conn) ((jolt.host/ref-get conn :close)) (net/close conn)))
 
 (defn- ba->latin1 [ba] (String. ba "ISO-8859-1"))
@@ -133,14 +188,16 @@
 
 (defn- accept-loop [listen-fd running? wrap]
   (loop []
-    (let [raw (c-accept listen-fd ffi/null ffi/null)]
+    (let [transport (accept-transport listen-fd)]
       (cond
         (not @running?) nil
-        (neg? raw) (when @running? (recur))
+        (nil? transport) (when @running? (recur))
         :else (do
                 (try
-                  (let [conn (if wrap (wrap raw) raw)] (serve-one conn))
-                  (catch Throwable _ (try (net/close raw) (catch Throwable _ nil))))
+                  (let [conn (if wrap (wrap transport) transport)]
+                    (serve-one conn))
+                  (catch Throwable _
+                    (try (net/close transport) (catch Throwable _ nil))))
                 (recur))))))
 
 (defn start-plain [port]
@@ -155,5 +212,5 @@
 
 (defn stop [server]
   (reset! (:running server) false)
-  (net/close (:fd server))
+  (raw-close (:fd server))
   nil)

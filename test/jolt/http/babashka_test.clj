@@ -46,6 +46,14 @@
   (let [r (http/get (str base "/get") {:as :stream})]
     (is (= "get" (slurp (:body r))))))
 
+(deftest request-timeout
+  (let [exception
+        (try
+          (http/get (str base "/timeout") {:timeout 1})
+          nil
+          (catch :default e e))]
+    (is (= java.net.http.HttpTimeoutException (class exception)))))
+
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.babashka-test)]
     (println (str "\n========== babashka.http-client =========="))
