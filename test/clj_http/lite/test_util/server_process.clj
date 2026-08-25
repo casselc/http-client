@@ -16,9 +16,15 @@
   ;; thrown? vacuously and crashes on the insecure request, wearing whatever
   ;; exception class the close happened to produce (RST vs clean EOF) — which
   ;; read as an intermittent TLS flake for a long time.
-  (let [pwd  (or (jolt.host/getenv "JOLT_PWD") (System/getProperty "user.dir"))
+  (let [pwd  (or (jolt.host/getenv "JOLT_PWD")
+                 (System/getProperty "user.dir")
+                 (jolt.host/getenv "PWD"))
         cert (str pwd "/test/resources/cert.pem")
         key  (str pwd "/test/resources/key.pem")
+        _ (doseq [path [cert key]]
+            (when-not (.exists (java.io.File. path))
+              (throw (ex-info (str "TLS test fixture not found: " path)
+                              {:path path}))))
         plain (srv/start-plain http-port)
         tls   (srv/start-tls https-port cert key)]
     (Thread/sleep 300)

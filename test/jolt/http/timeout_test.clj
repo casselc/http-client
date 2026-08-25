@@ -28,13 +28,13 @@
         held (atom [])]
     (future
       (loop []
-        (let [raw (srv/accept-raw fd)]
+        (let [transport (srv/accept-transport fd)]
           (when @running?
-            (when-not (neg? raw)
+            (when transport
               ;; Complete the handshake, read the request, then hold the
               ;; connection open forever. Keep a reference so nothing closes it.
-              (future (try (let [st (tls/tls-wrap-server raw cert key)]
-                             ((jolt.host/ref-get st :read) st nil)
+              (future (try (let [st (tls/tls-wrap-server transport cert key)]
+                             ((jolt.host/ref-get st :read) st {})
                              (swap! held conj st))
                            (catch Throwable _ nil))))
             (recur)))))
@@ -58,7 +58,7 @@
             "a silent https peer must surface as a read timeout, not park the thread")
         (is (< elapsed 10000)
             (str "should give up near the 1500ms timeout, took " elapsed "ms")))
-      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
 
 (deftest plain-http-still-honours-socket-timeout
   (let [port 18080
@@ -80,12 +80,12 @@
 ;; the defensive load in jolt.http.tls the SSL_* symbols come from a mix of two
 ;; implementations and the first call faults with "invalid memory reference".
 
-(defn- https-in-subprocess [requires]
+(defn- https-in-subprocess [requires url]
   ;; p/process takes the command vector first and the options map second.
   (let [expr (str "(require " requires " '[jolt.http-client :as http])"
-                  "(println :status (:status (http/get \"https://example.com\""
-                  " {:socket-timeout 20000})))")
-        proc (p/process ["jolt" "-e" expr] {:out :string :err :string})
+                  "(println :status (:status (http/get " (pr-str url)
+                  " {:insecure? true :socket-timeout 20000})))")
+        proc (p/process ["jolt" "-A:workspace" "-e" expr] {:out :string :err :string})
         done (deref proc 120000 ::timeout)]
     (if (= ::timeout done)
       (do (try (p/destroy-tree proc) (catch Throwable _ nil))
@@ -93,11 +93,17 @@
       {:exit (:exit done) :out (str (:out done)) :err (str (:err done))})))
 
 (deftest tls-survives-nrepl-loading-first
-  (let [{:keys [out err]} (https-in-subprocess "'[jolt.nrepl]")]
-    (is (str/includes? out ":status 200")
-        (str "https must work with jolt.nrepl loaded before it. out=" out " err=" err))
-    (is (not (str/includes? err "invalid memory reference"))
-        "an SSL_* symbol mix faults rather than failing cleanly")))
+  (let [port 18444
+        server (srv/start-tls port cert key)]
+    (try
+      (let [{:keys [out err]}
+            (https-in-subprocess "'[jolt.nrepl]"
+                                 (str "https://127.0.0.1:" port "/get"))]
+        (is (str/includes? out ":status 200")
+            (str "https must work with jolt.nrepl loaded before it. out=" out " err=" err))
+        (is (not (str/includes? err "invalid memory reference"))
+            "an SSL_* symbol mix faults rather than failing cleanly"))
+      (finally (srv/stop server)))))
 
 (deftest openssl-is-pinned-not-libressl
   ;; The concrete symptom to guard: macOS resolving to /usr/lib's LibreSSL. Both
@@ -119,19 +125,19 @@
         running? (atom true)]
     (future
       (loop []
-        (let [raw (srv/accept-raw fd)]
+        (let [transport (srv/accept-transport fd)]
           (when @running?
-            (when-not (neg? raw)
+            (when transport
               (future
                 (try
-                  (let [st (tls/tls-wrap-server raw cert key)
+                  (let [st (tls/tls-wrap-server transport cert key)
                         write (jolt.host/ref-get st :write)]
-                    ((jolt.host/ref-get st :read) st nil)
+                    ((jolt.host/ref-get st :read) st {})
                     ;; Valid headers promising a body that never finishes...
-                    (write st (byte-array (map int "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")))
+                    (write st (byte-array (map int "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")) {})
                     ;; ...then one byte at a time, forever.
                     (while @running?
-                      (write st (byte-array [(int \x)]))
+                      (write st (byte-array [(int \x)]) {})
                       (Thread/sleep 200)))
                   (catch Throwable _ nil))))
             (recur)))))
@@ -155,7 +161,7 @@
       (finally
         (platform/set-max-response-ms! nil)
         (reset! (:running srv) false)
-        (net/close (:fd srv))))))
+        (srv/close-listener! (:fd srv))))))
 
 (deftest no-cap-by-default
   ;; The historical behaviour is unbounded, and a cap applies process-wide, so a
@@ -215,12 +221,12 @@
         running? (atom true)]
     (future
       (loop []
-        (let [raw (srv/accept-raw fd)]
+        (let [transport (srv/accept-transport fd)]
           (when @running?
-            (when-not (neg? raw)
+            (when transport
               ;; give the client's bytes time to queue, then close UNREAD: the
               ;; close carries pending inbound data, so the kernel sends RST
-              (future (try (Thread/sleep 100) (net/close raw) (catch Throwable _ nil))))
+              (future (try (Thread/sleep 100) (net/close transport) (catch Throwable _ nil))))
             (recur)))))
     {:fd fd :running running?}))
 
@@ -228,15 +234,16 @@
   (let [port 18448
         srv (start-resetting-server port)]
     (try
-      (let [fd (net/connect "127.0.0.1" port nil)]
+      (let [fd (net/connect "127.0.0.1" port {})]
         (net/send-bytes fd (.getBytes "hello"))
         (let [e (try (net/recv-bytes fd) nil (catch Throwable e e))]
           (is (some? e) "a reset connection must throw, not return")
-          (is (str/includes? (str (class e)) "SocketException")
-              (str "ECONNRESET is a socket error, got " (class e)))
+          (is (= :connection-reset (:jolt.net/kind (ex-data e)))
+              (str "ECONNRESET keeps its structured transport kind, got "
+                   (pr-str (ex-data e))))
           (is (re-find #"[Rr]eset" (or (ex-message e) ""))
               (str "message must name the reset, got " (pr-str (ex-message e))))))
-      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
 
 (deftest tls-handshake-transport-failure-is-ssl-exception
   ;; JVM parity: a transport failure during the TLS handshake surfaces as
@@ -256,4 +263,4 @@
                  (class e)))
         (is (not (str/includes? (str (class e)) "SocketTimeoutException"))
             "the transport's own exception class must not leak through"))
-      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))

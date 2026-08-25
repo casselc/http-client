@@ -1,259 +1,195 @@
 (ns jolt.http.net
-  "A blocking BSD-socket TCP client over jolt.ffi: name resolution via
-  getaddrinfo, then socket/connect/recv/send/close. Shared by jolt.http.platform
-  (plaintext HTTP) and jolt.http.tls (the ciphertext transport under OpenSSL).
+  "Blocking byte transport for HTTP, implemented over the opaque
+  `teensyp.client` outbound TCP capability.
 
-  libc is declared in deps.edn (:jolt/native :process), so these process symbols
-  resolve at load. accept/recv/send/connect/getaddrinfo are marked :blocking so a
-  parked socket call never pins jolt's stop-the-world collector."
-  (:require [jolt.ffi :as ffi]
-            [jolt.io-poller :as poller]
-            [clojure.string :as str]))
+  This namespace owns the small compatibility boundary required by
+  HttpURLConnection: configured connect/read deadlines become monotonic
+  jolt-tcp deadlines; name resolution, connect refusal, and deadline expiry are
+  mapped to their Java boundary classes with the structured transport error as
+  the cause. Native reset/close/unknown failures otherwise pass through without
+  being collapsed into timeouts.
 
-(ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int :blocking)
-(ffi/defcfn c-close       "close"       [:int] :int)
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
-(ffi/defcfn c-getaddrinfo "getaddrinfo" [:pointer :pointer :pointer :pointer] :int :blocking)
-(ffi/defcfn c-freeaddrinfo "freeaddrinfo" [:pointer] :void)
-;; fcntl is variadic (int fd, int cmd, ...). A fixed-arity binding silently
-;; corrupts the flags argument on Apple arm64, where variadic args travel on
-;; the stack — the :varargs marker sits at the fixed/variadic boundary (two
-;; fixed args, then the variadic flags int) and emits the (__varargs_after 2)
-;; convention, so F_SETFL's third argument actually lands. The 2-arg
-;; c-fcntl-get binding is safe fixed-arity: F_GETFL passes no variadic args
-;; and named args ride the same registers in both conventions.
-(ffi/defcfn c-fcntl-get  "fcntl"      [:int :int] :int)
-(ffi/defcfn c-fcntl-set  "fcntl"      [:int :int :varargs :int] :int)
-(ffi/defcfn c-poll       "poll"       [:pointer :int :int] :int :blocking)
-(ffi/defcfn c-getsockopt "getsockopt" [:int :int :int :pointer :pointer] :int)
+  The underlying resolver is currently synchronous. A result observed after a
+  connect deadline is rejected, but an in-flight getaddrinfo cannot be
+  preempted.
 
-(def ^:private macos?
-  (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
-
-;; struct addrinfo field offsets (LP64). macOS swaps ai_canonname/ai_addr versus
-;; Linux, so ai_addr sits at 32 on macOS, 24 on Linux. ai_addrlen=16, ai_next=40.
-(def ^:private O-ai-family 4)
-(def ^:private O-ai-socktype 8)
-(def ^:private O-ai-protocol 12)
-(def ^:private O-ai-addrlen 16)
-(def ^:private O-ai-addr (if macos? 32 24))
-(def ^:private O-ai-next 40)
-
-;; SOL_SOCKET / SO_RCVTIMEO / SO_ERROR differ by platform: macOS 0xffff / 0x1006 /
-;; 0x1007, Linux 1 / 20 / 4.
-(def ^:private sol-socket (if macos? 0xffff 1))
-(def ^:private so-rcvtimeo (if macos? 0x1006 20))
-(def ^:private so-error (if macos? 0x1007 4))
-
-;; fcntl F_GETFL/F_SETFL are the same on macOS and Linux; O_NONBLOCK differs
-;; (Darwin 0x4, Linux 0x800). POLLOUT is 0x4 on both.
-(def ^:private f-getfl 3)
-(def ^:private f-setfl 4)
-(def ^:private o-nonblock (if macos? 0x4 0x800))
-(def ^:private po-pollout 4)
-
-(defn- conn-ex [class msg]
-  ;; a typed throwable so callers get the right (class e)/instance? AND a working
-  ;; .getMessage/ex-message (the cognitect aws backend reads .getMessage).
-  (throw (jolt.host/throwable class (str msg))))
-
-;; A timed connect needs the socket non-blocking: connect() then returns -1
-;; immediately (EINPROGRESS) and poll() waits on it, with SO_ERROR telling us
-;; whether the connection actually succeeded. fcntl F_SETFL is the only way to
-;; flip O_NONBLOCK, hence the variadic binding above.
-(defn- set-nonblock! [fd nonblocking?]
-  (let [flags (c-fcntl-get fd f-getfl)]
-    (when (neg? flags)
-      (conn-ex "java.io.IOException" "fcntl F_GETFL failed"))
-    ;; An unchecked F_SETFL is the one failure that hides itself: the socket
-    ;; stays blocking, connect() parks for the kernel's SYN window, and the
-    ;; timeout the caller asked for silently does nothing.
-    (when (neg? (c-fcntl-set fd f-setfl (if nonblocking?
-                                          (bit-or flags o-nonblock)
-                                          (bit-and-not flags o-nonblock))))
-      (conn-ex "java.io.IOException" "fcntl F_SETFL failed"))
-    nil))
-
-(defn- socket-error [fd]
-  ;; SO_ERROR for a socket poll() reported writable: 0 means the connect
-  ;; completed, anything else is the errno of the failed connect. getsockopt
-  ;; leaves the buffer untouched when it fails, so a fresh allocation would read
-  ;; back as whatever was in that memory — zero it and report a failed getsockopt
-  ;; as an error rather than risk calling a dead socket connected.
-  (let [err (ffi/alloc 4) len (ffi/alloc 4)]
-    (try
-      (ffi/write err :int 0 0)
-      (ffi/write len :uint 0 4)
-      (if (neg? (c-getsockopt fd sol-socket so-error err len))
-        -1
-        (ffi/read err :int))
-      (finally (ffi/free err) (ffi/free len)))))
-
-;; Return 0 when the connection is established, :timeout when the poll deadline
-;; elapsed, or a nonzero error code when the connect failed outright. All three
-;; non-success outcomes mean only "this address did not work" — the caller closes
-;; the fd and moves to the next one. connect() on a non-blocking socket returns
-;; -1 (EINPROGRESS) instead of blocking; poll then waits on it and SO_ERROR
-;; reports the outcome.
-(defn- timed-connect [fd addr addrlen timeout-ms]
-  (if (zero? (c-connect fd addr addrlen))
-    0
-    (let [pf (ffi/alloc 8)]
-      (try
-        ;; struct pollfd { int fd; short events; short revents; } — 8 bytes LP64.
-        ;; jolt.ffi has no 16-bit type, so events and revents are set by one :int
-        ;; write: little-endian puts events in the low half, revents (already
-        ;; zeroed) in the high half.
-        (dotimes [i 8] (ffi/write pf :uint8 i 0))
-        (ffi/write pf :int 0 fd)
-        (ffi/write pf :int 4 po-pollout)
-        (let [pr (c-poll pf 1 (int timeout-ms))]
-          (cond
-            ;; writable — the connect either completed or failed; SO_ERROR tells.
-            (pos? pr) (socket-error fd)
-            (zero? pr) :timeout
-            :else (conn-ex "java.io.IOException" "poll failed")))
-        (finally (ffi/free pf))))))
-
-(defn- attempt-connect [fd addr addrlen timeout-ms]
-  (if (and timeout-ms (pos? timeout-ms))
-    (do (set-nonblock! fd true)
-        (let [rc (timed-connect fd addr addrlen timeout-ms)]
-          ;; Restore blocking only for the fd we are handing back: recv/send and
-          ;; SO_RCVTIMEO downstream all assume a blocking socket. On any failure
-          ;; the caller closes it, so there is nothing to restore, and skipping
-          ;; the restore keeps a failing fcntl from masking the real error.
-          (when (= 0 rc) (set-nonblock! fd false))
-          rc))
-    (c-connect fd addr addrlen)))
-
-(defn connect
-  "Resolve host:port and open a connected TCP socket; return its fd. `timeout-ms`,
-  when positive, bounds each connect attempt with a non-blocking connect + poll —
-  without it, a blocked connect is bounded only by the kernel's SYN retry limit.
-  The bound is per address, as java.net.Socket's is: a host resolving to both a
-  dead and a live address still connects. Throws a java.net.UnknownHostException
-  / ConnectException-tagged throwable on failure."
-  ([host port] (connect host port nil))
-  ([host port timeout-ms]
-   (let [node    (ffi/string->ptr (str host))
-         service (ffi/string->ptr (str port))
-         respp   (ffi/alloc (ffi/sizeof :pointer))
-         ;; hints: ai_socktype = SOCK_STREAM, else getaddrinfo also returns UDP
-         ;; entries and connect() on a datagram socket spuriously "succeeds".
-         hints   (ffi/alloc 48)]
-     (dotimes [i 48] (ffi/write hints :uint8 i 0))
-     (ffi/write hints :int O-ai-socktype 1)   ; SOCK_STREAM
-     (try
-       (let [rc (c-getaddrinfo node service hints respp)]
-         (when-not (zero? rc)
-           (conn-ex "java.net.UnknownHostException" (str host)))
-         (let [res (ffi/read respp :pointer)]
-           (try
-             ;; Walk every address getaddrinfo returned. A timeout retires only
-             ;; the address it happened on — a name whose AAAA blackholes and
-             ;; whose A answers is the ordinary shape of a broken-IPv6 network,
-             ;; and giving up on the host there would make :conn-timeout turn a
-             ;; working request into a failing one. `timed-out?` only decides
-             ;; which message the exhausted walk reports.
-             (loop [ai res timed-out? false]
-               (if (ffi/null? ai)
-                 (conn-ex "java.net.ConnectException"
-                          (if timed-out?
-                            (str "connect timed out: " host ":" port)
-                            (str "connection refused: " host ":" port)))
-                 (let [fam     (ffi/read ai :int O-ai-family)
-                       sockt   (ffi/read ai :int O-ai-socktype)
-                       proto   (ffi/read ai :int O-ai-protocol)
-                       addrlen (ffi/read ai :int O-ai-addrlen)
-                       addr    (ffi/read ai :pointer O-ai-addr)
-                       fd      (c-socket fam sockt proto)]
-                   (cond
-                     (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out?)
-                     :else (try
-                             (let [rc (attempt-connect fd addr addrlen timeout-ms)]
-                               (if (= 0 rc)
-                                 fd
-                                 (do (c-close fd)
-                                     (recur (ffi/read ai :pointer O-ai-next)
-                                            (or timed-out? (= :timeout rc))))))
-                             (catch Throwable t (c-close fd) (throw t)))))))
-             (finally (c-freeaddrinfo res)))))
-       (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints))))))
-
-(defn set-read-timeout!
-  "Apply SO_RCVTIMEO of `ms` milliseconds to `fd` (a recv past it returns -1)."
-  [fd ms]
-  (when (and ms (pos? ms))
-    ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 16 bytes LP64.
-    (let [tv (ffi/alloc 16)]
-      (dotimes [i 16] (ffi/write tv :uint8 i 0))
-      (ffi/write tv :long 0 (quot ms 1000))
-      (ffi/write tv :long 8 (* (rem ms 1000) 1000))
-      (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
-      (ffi/free tv))))
+  No native descriptor, socket handle, sockaddr, or libc binding crosses this
+  layer. TLS consumes the same send/receive/close surface over memory BIOs."
+  (:require [teensyp.client :as client]))
 
 (def ^:private bufsize 65536)
+(def ^:private nanos-per-ms 1000000)
+(def ^:private transport-marker ::transport)
+(def ^:private send-fn-key ::send-fn)
+(def ^:private receive-fn-key ::receive-fn)
+(def ^:private close-fn-key ::close-fn)
+(def ^:private read-timeout-key ::read-timeout-ms)
 
-;; errno values differ per platform: EINTR is 4 on both; EAGAIN 35/11,
-;; ECONNRESET 54/104, EPIPE 32/32 (macOS/Linux).
-(def ^:private eintr 4)
-(def ^:private eagain (if macos? 35 11))
-(def ^:private econnreset (if macos? 54 104))
-(def ^:private epipe 32)
+(defn- typed-ex [class message cause]
+  (jolt.host/throwable class (str message) cause))
 
-(defn- recv-err-ex
-  "The exception a negative recv deserves, classed by what actually failed:
-  EAGAIN is the SO_RCVTIMEO firing (SocketTimeoutException), ECONNRESET/EPIPE
-  are the peer tearing the connection down mid-flight (SocketException, like
-  java.net). Reported before by every failure alike as \"Read timed out\",
-  which sent anyone debugging a reset connection chasing a timeout that was
-  never set — that misdirection is what self-signed-ssl-get's flake printed."
-  [err]
+(defn- monotonic-now []
+  (System/nanoTime))
+
+(defn- timeout-error? [exception]
+  (let [data (ex-data exception)]
+    (or (= :timed-out (:teensyp.client/kind data))
+        (= :timed-out (:jolt.net/kind data)))))
+
+(defn- connect-boundary-ex [host port exception]
+  (let [data (ex-data exception)
+        kind (:jolt.net/kind data)
+        message (or (ex-message exception)
+                    (str "connection failed: " host ":" port))]
+    (cond
+      (= :name-resolution kind)
+      (typed-ex "java.net.UnknownHostException" (str host) exception)
+
+      (timeout-error? exception)
+      (typed-ex "java.net.SocketTimeoutException"
+                (str "Connect timed out: " host ":" port)
+                exception)
+
+      (or (= :connection-refused kind)
+          (= :unreachable kind))
+      (typed-ex "java.net.ConnectException" message exception)
+
+      :else exception)))
+
+(defn- read-boundary-ex [exception]
+  (if (timeout-error? exception)
+    (typed-ex "java.net.SocketTimeoutException" "Read timed out" exception)
+    exception))
+
+(defn- make-transport
+  [send-fn receive-fn close-fn read-timeout-ms]
+  {transport-marker true
+   send-fn-key send-fn
+   receive-fn-key receive-fn
+   close-fn-key close-fn
+   read-timeout-key (atom read-timeout-ms)})
+
+(defn callback-transport
+  "Create a descriptor-free byte transport from callbacks.
+
+  This is an adapter seam for the in-process TLS test server. Production
+  outbound transports are created by [[connect]] and close over an opaque
+  teensyp.client connection. `send-fn` receives bytes plus an operation-options
+  map; `receive-fn` receives the operation-options map. The map is empty for an
+  unbounded operation and otherwise carries either `:timeout-ms` or the one
+  request-wide `:deadline-nanos`."
+  [{:keys [send-fn receive-fn close-fn read-timeout-ms]}]
+  (when-not (and (fn? send-fn) (fn? receive-fn) (fn? close-fn))
+    (throw (ex-info "jolt.http.net callback transport requires send/receive/close functions"
+                    {:jolt.http.net/kind :invalid-callback-transport})))
+  (make-transport send-fn receive-fn close-fn read-timeout-ms))
+
+(defn transport? [value]
+  (and (map? value) (true? (get value transport-marker))))
+
+(defn- require-transport! [transport op]
+  (when-not (transport? transport)
+    (throw (ex-info (str "jolt.http.net " (name op)
+                         ": expected an opaque byte transport")
+                    {:jolt.http.net/op op
+                     :jolt.http.net/kind :invalid-transport})))
+  transport)
+
+(defn- connect-options
+  [connect-timeout-ms deadline-nanos]
   (cond
-    (= err eagain)      (conn-ex "java.net.SocketTimeoutException" "Read timed out")
-    (= err econnreset)  (conn-ex "java.net.SocketException" "Connection reset")
-    (= err epipe)       (conn-ex "java.net.SocketException" "Broken pipe")
-    :else               (conn-ex "java.net.SocketException"
-                                  (str "recv failed (errno " err ")"))))
+    (some? deadline-nanos)
+    {:deadline-nanos
+     (if (and connect-timeout-ms (pos? connect-timeout-ms))
+       (min deadline-nanos
+            (+ (monotonic-now)
+               (* connect-timeout-ms nanos-per-ms)))
+       deadline-nanos)}
+
+    (and connect-timeout-ms (pos? connect-timeout-ms))
+    {:connect-timeout-ms connect-timeout-ms}
+
+    :else
+    ;; This explicit nil is distinct from omitting the option: teensyp.client's
+    ;; omission default is 30 seconds, while URLConnection zero/unset is
+    ;; unbounded.
+    {:connect-timeout-ms nil}))
+
+(defn- operation-options [opts]
+  (if (some? (:deadline-nanos opts))
+    {:deadline-nanos (:deadline-nanos opts)}
+    {}))
+
+(defn connect
+  "Open an opaque outbound TCP transport.
+
+  Options:
+  - a positive `:connect-timeout-ms` is one monotonic deadline across resolution
+    and all address candidates; nil/zero is explicitly unbounded.
+  - `:deadline-nanos` is an optional request-wide absolute monotonic deadline.
+    When both deadlines are bounded, the earlier one governs connect.
+  - `:read-timeout-ms` is an inactivity deadline applied independently to each
+    receive. Nil/zero means unbounded, matching URLConnection read semantics."
+  ([host port] (connect host port {}))
+  ([host port {:keys [connect-timeout-ms read-timeout-ms deadline-nanos]}]
+   (let [connect-opts (connect-options connect-timeout-ms deadline-nanos)]
+     (try
+       (let [connection (client/connect (str host) port connect-opts)]
+         (make-transport
+           (fn [data opts]
+             (if (seq opts)
+               (client/send-all! connection data opts)
+               (client/send-all! connection data)))
+           (fn [opts]
+             (if (seq opts)
+               (client/receive-at-most! connection bufsize opts)
+               (client/receive-at-most! connection bufsize)))
+           #(client/close! connection)
+           read-timeout-ms))
+       (catch :default exception
+         (throw (connect-boundary-ex host port exception)))))))
+
+(defn set-read-timeout!
+  "Set the inactivity timeout used by subsequent receives. Nil/zero disables
+  the deadline. Returns nil for HttpURLConnection compatibility."
+  [transport timeout-ms]
+  (require-transport! transport :set-read-timeout)
+  (reset! (get transport read-timeout-key) timeout-ms)
+  nil)
 
 (defn recv-bytes
-  "Read up to one bufferful from `fd`: a byte-array, nil at EOF (recv 0), or a
-  thrown exception classed by errno (see recv-err-ex)."
-  [fd]
-  (let [buf (ffi/alloc bufsize)]
-    (try
-      (loop []
-        (let [got (c-recv fd buf bufsize 0)
-              err (when (neg? got) (poller/errno))]
-          (cond
-            (pos? got) (ffi/read-array buf got)
-            (zero? got) nil
-            ;; a signal is not the peer going away; the read is simply owed again
-            (= err eintr) (recur)
-            :else (throw (recv-err-ex err)))))
-      (finally (ffi/free buf)))))
+  "Receive at most one transport chunk, or nil at EOF.
+
+  Only an actual operation deadline is mapped to SocketTimeoutException.
+  Connection reset, close, and unknown native failures retain their original
+  structured exception identity."
+  ([transport] (recv-bytes transport {}))
+  ([transport opts]
+   (require-transport! transport :receive)
+   (let [absolute-opts (operation-options opts)
+         timeout-ms @(get transport read-timeout-key)
+         receive-opts (if (seq absolute-opts)
+                        absolute-opts
+                        (if (and timeout-ms (pos? timeout-ms))
+                          {:timeout-ms timeout-ms}
+                          {}))]
+     (try
+       ((get transport receive-fn-key) receive-opts)
+       (catch :default exception
+         (throw (read-boundary-ex exception)))))))
 
 (defn send-bytes
-  "Send all of byte-array `data` over `fd`."
-  [fd data]
-  (let [n (alength data)
-        buf (ffi/alloc (max 1 n))]
-    (try
-      (ffi/write-array buf data)
-      (loop [off 0]
-        (when (< off n)
-          (let [sent (c-send fd (+ buf off) (- n off) 0)
-                err (when (neg? sent) (poller/errno))]
-            (cond
-              (pos? sent) (recur (+ off sent))
-              (= err eintr) (recur off)
-              (= err econnreset) (conn-ex "java.net.SocketException" "Connection reset")
-              (= err epipe) (conn-ex "java.net.SocketException" "Broken pipe")
-              :else (conn-ex "java.io.IOException" (str "send failed (errno " err ")"))))))
-      (finally (ffi/free buf)))))
+  "Send the entire byte-array. teensyp.client handles partial writes and
+  same-direction serialization."
+  ([transport data] (send-bytes transport data {}))
+  ([transport data opts]
+   (require-transport! transport :send)
+   ((get transport send-fn-key) data (operation-options opts))
+   nil))
 
-(defn close [fd] (c-close fd) nil)
+(defn close
+  "Close the opaque transport. Idempotence is delegated to its owner."
+  [transport]
+  (require-transport! transport :close)
+  ((get transport close-fn-key))
+  nil)
