@@ -8,48 +8,50 @@
             [jolt.http.test-server :as srv]
             [clojure.test :refer [deftest is run-tests use-fixtures]]))
 
-(def ^:private port 18095)
-(def ^:private base (str "http://localhost:" port))
+(def ^:dynamic *base* nil)
 
 (defn- with-server [t]
-  (let [s (srv/start-plain port)]
-    (try (t) (finally (srv/stop s)))))
+  (let [s (srv/start-plain)]
+    (try
+      (binding [*base* (str "http://localhost:" (:port s))]
+        (t))
+      (finally (srv/stop s)))))
 
 (use-fixtures :once with-server)
 
 (deftest get-request
-  (let [r (http/get (str base "/get"))]
+  (let [r (http/get (str *base* "/get"))]
     (is (= 200 (:status r)))
     (is (= "get" (:body r)))))
 
 (deftest post-request
-  (let [r (http/post (str base "/post") {:body "hello=world"})]
+  (let [r (http/post (str *base* "/post") {:body "hello=world"})]
     (is (= 200 (:status r)))
     (is (= "hello=world" (:body r)))))
 
 (deftest sends-request-headers
-  (let [r (http/get (str base "/header") {:headers {"x-my-header" "yes"}})]
+  (let [r (http/get (str *base* "/header") {:headers {"x-my-header" "yes"}})]
     (is (= 200 (:status r)))
     (is (= "yes" (:body r)))))
 
 (deftest response-headers-lowercased
-  (let [r (http/get (str base "/get"))]
+  (let [r (http/get (str *base* "/get"))]
     ;; java.net.http lowercases header names; the shim matches it
     (is (some? (get-in r [:headers "content-length"])))))
 
 (deftest as-bytes
-  (let [r (http/get (str base "/get") {:as :bytes})]
+  (let [r (http/get (str *base* "/get") {:as :bytes})]
     (is (bytes? (:body r)))
     (is (= "get" (String. ^bytes (:body r) "UTF-8")))))
 
 (deftest as-stream
-  (let [r (http/get (str base "/get") {:as :stream})]
+  (let [r (http/get (str *base* "/get") {:as :stream})]
     (is (= "get" (slurp (:body r))))))
 
 (deftest request-timeout
   (let [exception
         (try
-          (http/get (str base "/timeout") {:timeout 1})
+          (http/get (str *base* "/timeout") {:timeout 1})
           nil
           (catch :default e e))]
     (is (= java.net.http.HttpTimeoutException (class exception)))))
