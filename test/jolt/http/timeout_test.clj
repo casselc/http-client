@@ -22,8 +22,8 @@
 (def ^:private cert (str (System/getProperty "user.dir") "/test/resources/cert.pem"))
 (def ^:private key  (str (System/getProperty "user.dir") "/test/resources/key.pem"))
 
-(defn- start-stalling-tls [port]
-  (let [fd (srv/listen-socket port)
+(defn- start-stalling-tls []
+  (let [{:keys [fd port]} (srv/open-listener)
         running? (atom true)
         held (atom [])]
     (future
@@ -45,8 +45,8 @@
   ;; never applied to the socket underneath OpenSSL and recv parked forever. A
   ;; timed deref cannot preempt a thread inside a blocking FFI call, so this was
   ;; unrecoverable from inside the process rather than merely slow.
-  (let [port 18443
-        srv (start-stalling-tls port)]
+  (let [srv (start-stalling-tls)
+        port (:port srv)]
     (try
       (let [t0 (System/currentTimeMillis)
             outcome (try (http/get (str "https://127.0.0.1:" port "/get")
@@ -61,8 +61,8 @@
       (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
 
 (deftest plain-http-still-honours-socket-timeout
-  (let [port 18080
-        srv (srv/start-plain port)]
+  (let [srv (srv/start-plain)
+        port (:port srv)]
     (try
       (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")
                                     {:socket-timeout 5000}))))
@@ -93,8 +93,8 @@
       {:exit (:exit done) :out (str (:out done)) :err (str (:err done))})))
 
 (deftest tls-survives-nrepl-loading-first
-  (let [port 18444
-        server (srv/start-tls port cert key)]
+  (let [server (srv/start-tls cert key)
+        port (:port server)]
     (try
       (let [{:keys [out err]}
             (https-in-subprocess "'[jolt.nrepl]"
@@ -120,8 +120,8 @@
 ;; one-byte-per-second server ran past two minutes and was still going. That
 ;; leaks a socket and a parked thread per attempt, since nothing unwinds.
 
-(defn- start-trickling-tls [port]
-  (let [fd (srv/listen-socket port)
+(defn- start-trickling-tls []
+  (let [{:keys [fd port]} (srv/open-listener)
         running? (atom true)]
     (future
       (loop []
@@ -141,11 +141,11 @@
                       (Thread/sleep 200)))
                   (catch Throwable _ nil))))
             (recur)))))
-    {:fd fd :running running?}))
+    {:fd fd :port port :running running?}))
 
 (deftest a-trickling-peer-is-bounded-by-the-total-deadline
-  (let [port 18445
-        srv (start-trickling-tls port)]
+  (let [srv (start-trickling-tls)
+        port (:port srv)]
     (try
       (platform/set-max-response-ms! 4000)
       (let [t0 (System/currentTimeMillis)
@@ -166,8 +166,8 @@
 (deftest no-cap-by-default
   ;; The historical behaviour is unbounded, and a cap applies process-wide, so a
   ;; library that quietly imposed one would change every consumer.
-  (let [port 18446
-        srv (srv/start-plain port)]
+  (let [srv (srv/start-plain)
+        port (:port srv)]
     (try
       (platform/set-max-response-ms! nil)
       (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")))))
@@ -199,8 +199,8 @@
 ;; connect + poll path, which is the part that has to keep the loop going: a
 ;; per-address failure means "try the next one", never "give up on the host".
 (deftest conn-timeout-still-walks-every-address
-  (let [port 18447
-        srv (srv/start-plain port)]
+  (let [srv (srv/start-plain)
+        port (:port srv)]
     (try
       (is (= 200 (:status (http/get (str "http://localhost:" port "/get")
                                     {:conn-timeout 2000 :socket-timeout 5000})))
@@ -216,8 +216,8 @@
 ;; java.net.SocketTimeoutException". The message misdirects debugging to
 ;; SO_RCVTIMEO, which was never set.
 
-(defn- start-resetting-server [port]
-  (let [fd (srv/listen-socket port)
+(defn- start-resetting-server []
+  (let [{:keys [fd port]} (srv/open-listener)
         running? (atom true)]
     (future
       (loop []
@@ -228,11 +228,11 @@
               ;; close carries pending inbound data, so the kernel sends RST
               (future (try (Thread/sleep 100) (net/close transport) (catch Throwable _ nil))))
             (recur)))))
-    {:fd fd :running running?}))
+    {:fd fd :port port :running running?}))
 
 (deftest recv-classifies-reset-not-timeout
-  (let [port 18448
-        srv (start-resetting-server port)]
+  (let [srv (start-resetting-server)
+        port (:port srv)]
     (try
       (let [fd (net/connect "127.0.0.1" port {})]
         (net/send-bytes fd (.getBytes "hello"))
@@ -252,8 +252,8 @@
   ;; used to escape tls-connect untouched, so a mid-handshake reset read as a
   ;; read timeout to every caller — including clj-http-lite's
   ;; (is (thrown? SSLException ...)) in self-signed-ssl-get.
-  (let [port 18449
-        srv (start-resetting-server port)]
+  (let [srv (start-resetting-server)
+        port (:port srv)]
     (try
       (let [e (try (tls/tls-connect "127.0.0.1" port false) nil
                    (catch Throwable e e))]

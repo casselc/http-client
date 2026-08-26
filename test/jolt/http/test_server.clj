@@ -11,6 +11,7 @@
 (ffi/defcfn c-socket     "socket"     [:int :int :int] :int)
 (ffi/defcfn c-bind       "bind"       [:int :pointer :int] :int)
 (ffi/defcfn c-listen     "listen"     [:int :int] :int)
+(ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
 (ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
 (ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -42,19 +43,54 @@
     (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 7 1)   ; 127.0.0.1
     sa))
 
-(defn listen-socket [port]
-  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
-    (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    (let [opt (ffi/alloc 4)]
-      (ffi/write opt :int 0 1)
-      (c-setsockopt fd sol-socket so-reuse opt 4)
-      (ffi/free opt))
-    (let [sa (make-sockaddr port)]
-      (when (neg? (c-bind fd sa 16))
-        (raw-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
-      (ffi/free sa))
-    (when (neg? (c-listen fd 64)) (raw-close fd) (throw (ex-info "listen() failed" {})))
-    fd))
+(defn listen-socket
+  ([] (listen-socket 0))
+  ([port]
+   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
+     (when (neg? fd) (throw (ex-info "socket() failed" {})))
+     (try
+       (let [opt (ffi/alloc 4)]
+         (try
+           (ffi/write opt :int 0 1)
+           (c-setsockopt fd sol-socket so-reuse opt 4)
+           (finally (ffi/free opt))))
+       (let [sa (make-sockaddr port)]
+         (try
+           (when (neg? (c-bind fd sa 16))
+             (throw (ex-info (str "bind() failed on port " port) {})))
+           (finally (ffi/free sa))))
+       (when (neg? (c-listen fd 64))
+         (throw (ex-info "listen() failed" {})))
+       fd
+       (catch Throwable error
+         (raw-close fd)
+         (throw error))))))
+
+(defn listener-port
+  "Return the kernel-assigned TCP port for a listening descriptor."
+  [fd]
+  (let [sa (ffi/alloc 16)]
+    (try
+      (let [lenp (ffi/alloc 4)]
+        (try
+          (ffi/write lenp :uint 0 16)
+          (when (neg? (c-getsockname fd sa lenp))
+            (throw (ex-info "getsockname() failed" {:fd fd})))
+          (+ (bit-shift-left (ffi/read sa :uint8 2) 8)
+             (ffi/read sa :uint8 3))
+          (finally (ffi/free lenp))))
+      (finally (ffi/free sa)))))
+
+(defn open-listener
+  "Open a loopback listener and report both its descriptor and assigned port."
+  ([] (open-listener 0))
+  ([port]
+   (let [fd (listen-socket port)]
+     (try
+       {:fd fd :port (listener-port fd)}
+       (catch Throwable error
+         (raw-close fd)
+         (throw error))))))
 
 ;; The listener is intentionally test-only raw FFI. Accepted descriptors are
 ;; immediately hidden behind the same callback transport TLS consumes, so no
@@ -200,15 +236,21 @@
                     (try (net/close transport) (catch Throwable _ nil))))
                 (recur))))))
 
-(defn start-plain [port]
-  (let [fd (listen-socket port) running? (atom true)]
-    (future (accept-loop fd running? nil))
-    {:fd fd :port port :running running?}))
+(defn start-plain
+  ([] (start-plain 0))
+  ([port]
+   (let [{:keys [fd port]} (open-listener port)
+         running? (atom true)]
+     (future (accept-loop fd running? nil))
+     {:fd fd :port port :running running?})))
 
-(defn start-tls [port cert key]
-  (let [fd (listen-socket port) running? (atom true)]
-    (future (accept-loop fd running? (fn [raw] (tls/tls-wrap-server raw cert key))))
-    {:fd fd :port port :running running?}))
+(defn start-tls
+  ([cert key] (start-tls 0 cert key))
+  ([port cert key]
+   (let [{:keys [fd port]} (open-listener port)
+         running? (atom true)]
+     (future (accept-loop fd running? (fn [raw] (tls/tls-wrap-server raw cert key))))
+     {:fd fd :port port :running running?})))
 
 (defn stop [server]
   (reset! (:running server) false)

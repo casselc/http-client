@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [jolt.http.net :as net]
             [jolt.http.platform :as platform]
+            [jolt.http.test-server :as srv]
             [jolt.http.tls :as tls]
             [teensyp.client :as client]))
 
@@ -17,6 +18,17 @@
     (doseq [[key value] values]
       (jolt.host/ref-put! table key value))
     table))
+
+(deftest ephemeral-test-listeners-can-coexist
+  (let [first-server (srv/start-plain)
+        second-server (srv/start-plain)]
+    (try
+      (is (pos? (:port first-server)))
+      (is (pos? (:port second-server)))
+      (is (not= (:port first-server) (:port second-server)))
+      (finally
+        (srv/stop second-server)
+        (srv/stop first-server)))))
 
 (deftest opaque-client-carries-deadlines-and-whole-byte-calls
   (let [calls (atom [])

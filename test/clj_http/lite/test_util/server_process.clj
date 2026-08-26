@@ -5,9 +5,6 @@
   same routes, and returns their ports. `kill` stops them."
   (:require [jolt.http.test-server :as srv]))
 
-(def ^:private http-port 18091)
-(def ^:private https-port 18092)
-
 (defn launch []
   ;; JOLT_PWD is set by CI but not by an interactive `jolt -M:test` — without
   ;; the user.dir fallback the cert path becomes "/test/resources/cert.pem",
@@ -25,10 +22,10 @@
             (when-not (.exists (java.io.File. path))
               (throw (ex-info (str "TLS test fixture not found: " path)
                               {:path path}))))
-        plain (srv/start-plain http-port)
-        tls   (srv/start-tls https-port cert key)]
+        plain (srv/start-plain)
+        tls   (srv/start-tls cert key)]
     (Thread/sleep 300)
-    {:http-port http-port :https-port https-port :plain plain :tls tls}))
+    {:http-port (:port plain) :https-port (:port tls) :plain plain :tls tls}))
 
 (defn kill [{:keys [plain tls]}]
   (when plain (srv/stop plain))
