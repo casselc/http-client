@@ -1,8 +1,8 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.7.19: jolt.http.net reads errno through jolt.io-poller (which 0.6.8
-# predates), and 0.7.19 is where jolt's own java.io byte streams answer the full
+# floor is 0.7.27: jolt.http.net reads errno through jolt.io-poller (which 0.6.8
+# predates), and current jolt's own java.io byte streams answer the full
 # surface (readNBytes/transferTo/mark), so jolt.http.platform hands back jolt's
 # classes instead of registering its shims. On older jolts the suite dies at
 # namespace load with "Could not locate jolt/io_poller".
@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      JOLT_VERSION: '0.7.19'
+      JOLT_VERSION: '0.7.27'
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
@@ -30,4 +30,10 @@ jobs:
             | bash -s -- --dir "$HOME/.jolt" --version "$JOLT_VERSION"
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
       - name: Test
-        run: JOLT_PWD="$PWD" jolt -M:test
+        run: |
+          set -euo pipefail
+          export JOLT_PWD="$PWD"
+          jolt -M:test
+          jolt -M:timeouttest
+          jolt -M:zlibtest
+          jolt -M:bhctest
