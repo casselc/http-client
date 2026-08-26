@@ -85,7 +85,7 @@
   (let [expr (str "(require " requires " '[jolt.http-client :as http])"
                   "(println :status (:status (http/get " (pr-str url)
                   " {:insecure? true :socket-timeout 20000})))")
-        proc (p/process ["jolt" "-A:workspace" "-e" expr] {:out :string :err :string})
+        proc (p/process ["jolt" "-e" expr] {:out :string :err :string})
         done (deref proc 120000 ::timeout)]
     (if (= ::timeout done)
       (do (try (p/destroy-tree proc) (catch Throwable _ nil))
