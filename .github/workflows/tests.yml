@@ -15,7 +15,7 @@ jobs:
     env:
       JOLT_VERSION: '0.7.27'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install jolt
         run: |
           set -euo pipefail
