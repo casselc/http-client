@@ -65,14 +65,13 @@ unbounded behavior. That compatibility setting is process-wide.
 
 ## Requirements
 
-- Jolt 0.7.19 or newer. This is where Jolt's own `java.io` byte streams answer
-  the full surface, so this library can use those host classes instead of
-  registering process-wide `ByteArrayInputStream`/`ByteArrayOutputStream` shims.
+- Jolt 0.7.27 or newer. This release supplies the current host byte-stream and
+  native transport APIs used by the library and its pinned dependencies.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests
 
-`jolt -A:workspace -M:test` runs clj-http-lite's own `client`, `links` and `integration`
+`jolt -M:test` runs clj-http-lite's own `client`, `links` and `integration`
 suites under Jolt. The suites are vendored under `test/clj_http/lite`; their
 `server-process` fixture is replaced with in-process plaintext + TLS servers
 (`jolt.http.test-server`, with a test-only listener feeding the same opaque byte
@@ -80,14 +79,14 @@ transport + OpenSSL engine) in place of the suite's Jetty subprocess — no
 external checkout needed.
 
 ```
-jolt -A:workspace -M:test
+jolt -M:test
 ```
 
 The main suite includes deterministic transport/deadline and TLS error-ordering
 tests in addition to clj-http-lite's integration suite. Additional suites are:
 
 ```
-jolt -A:workspace -M:timeouttest   # timeout/deadline regressions
-jolt -A:workspace -M:bhctest       # babashka.http-client compatibility
-jolt -A:workspace -M:zlibtest      # zlib round-trip, no sockets
+jolt -M:timeouttest   # timeout/deadline regressions
+jolt -M:bhctest       # babashka.http-client compatibility
+jolt -M:zlibtest      # zlib round-trip, no sockets
 ```
