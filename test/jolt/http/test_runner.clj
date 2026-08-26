@@ -12,6 +12,7 @@
             [clj-http.lite.links-test]
             [clj-http.lite.client-test]
             [jolt.http.net-test]
+            [jolt.http.test-server-test]
             [jolt.http.tls-test]
             [clj-http.lite.integration-test]))
 

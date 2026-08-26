@@ -16,6 +16,7 @@
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
 (ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
 (ffi/defcfn c-close      "close"      [:int] :int)
 
 (def ^:private AF-INET 2)
@@ -26,6 +27,7 @@
 (def ^:private so-reuse   (if macos? 4 2))
 (def ^:private so-nosigpipe 0x1022)
 (def ^:private msg-nosignal (if macos? 0 0x4000))
+(def ^:private shut-rdwr 2)
 (def ^:private io-bufsize 65536)
 
 (defn- raw-close [fd]
@@ -240,19 +242,29 @@
   ([] (start-plain 0))
   ([port]
    (let [{:keys [fd port]} (open-listener port)
-         running? (atom true)]
-     (future (accept-loop fd running? nil))
-     {:fd fd :port port :running running?})))
+         running? (atom true)
+         acceptor (future (accept-loop fd running? nil))]
+     {:fd fd :port port :running running? :acceptor acceptor})))
 
 (defn start-tls
   ([cert key] (start-tls 0 cert key))
   ([port cert key]
    (let [{:keys [fd port]} (open-listener port)
-         running? (atom true)]
-     (future (accept-loop fd running? (fn [raw] (tls/tls-wrap-server raw cert key))))
-     {:fd fd :port port :running running?})))
+         running? (atom true)
+         acceptor (future (accept-loop fd running? (fn [raw] (tls/tls-wrap-server raw cert key))))]
+     {:fd fd :port port :running running? :acceptor acceptor})))
 
 (defn stop [server]
   (reset! (:running server) false)
+  ;; close(2) in another thread does not portably interrupt a blocking accept(2).
+  ;; shutdown(2) wakes it first; retaining and joining the future ensures no
+  ;; server thread can keep the Jolt process alive after the suite completes.
+  (c-shutdown (:fd server) shut-rdwr)
   (raw-close (:fd server))
+  (let [acceptor (:acceptor server)
+        result (deref acceptor 5000 ::timeout)]
+    (when (= ::timeout result)
+      (future-cancel acceptor)
+      (throw (ex-info "test server accept loop did not stop"
+                      {:port (:port server)}))))
   nil)
