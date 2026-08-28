@@ -65,8 +65,9 @@ unbounded behavior. That compatibility setting is process-wide.
 
 ## Requirements
 
-- Jolt 0.7.27 or newer. This release supplies the host byte-stream and native
-  transport APIs used by the library and its pinned dependencies.
+- Jolt 0.7.28 or newer. This release supplies the scoped native-allocation,
+  host byte-stream, and native transport APIs used by the library and its
+  pinned dependencies.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests

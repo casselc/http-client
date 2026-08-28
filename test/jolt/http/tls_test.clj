@@ -19,6 +19,9 @@
       :receive-fn (fn [_opts] (receive-fn))
       :close-fn (fn [] true)})))
 
+(defn- event-count [events event]
+  (count (filter #(= event %) events)))
+
 (deftest ssl-error-is-captured-before-any-bio-work
   (let [events (atom [])
         result
@@ -148,3 +151,106 @@
         (is (nil? ((jolt.host/ref-get st :read) st nil)))))
     (is (= 1 @calls))
     (is (true? (jolt.host/ref-get st :eof)))))
+
+(deftest repeated-and-concurrent-close-releases-tls-engine-once
+  (let [events (atom [])
+        transport
+        (net/callback-transport
+          {:send-fn (fn [_data _opts] nil)
+           :receive-fn (fn [_opts] nil)
+           :close-fn (fn [] (swap! events conj :transport-close))})
+        st (@#'tls/make-stream transport :ssl :ctx :rbio :wbio)
+        close! (jolt.host/ref-get st :close)]
+    (with-redefs-fn
+      {#'tls/c-ERR-clear-error
+       (fn [] (swap! events conj :clear))
+       #'tls/c-SSL-shutdown
+       (fn [_] (swap! events conj :ssl-shutdown) 1)
+       #'tls/c-BIO-ctrl
+       (fn [& _] 0)
+       #'tls/c-SSL-free
+       (fn [_] (swap! events conj :ssl-free))
+       #'tls/c-SSL-CTX-free
+       (fn [_] (swap! events conj :ctx-free))}
+      (fn []
+        (let [start (promise)
+              workers (doall
+                        (for [_ (range 16)]
+                          (future @start (close!))))]
+          (deliver start true)
+          (doseq [worker workers] @worker)
+          ;; A call after every contender has completed must also be inert.
+          (close!))))
+    (is (= 1 (event-count @events :clear)))
+    (is (= 1 (event-count @events :ssl-shutdown)))
+    (is (= 1 (event-count @events :transport-close)))
+    (is (= 1 (event-count @events :ssl-free)))
+    (is (= 1 (event-count @events :ctx-free)))))
+
+(deftest partial-bio-acquisition-frees-only-owned-resources
+  (let [events (atom [])
+        bio-results (atom [:rbio :null])
+        exception
+        (with-redefs-fn
+          {#'ffi/null? #(= :null %)
+           #'tls/c-SSL-CTX-new (fn [_] :ctx)
+           #'tls/c-SSL-new (fn [_] :ssl)
+           #'tls/c-BIO-s-mem (fn [] :bio-method)
+           #'tls/c-BIO-new
+           (fn [_]
+             (let [result (first @bio-results)]
+               (swap! bio-results subvec 1)
+               result))
+           #'tls/c-BIO-free
+           (fn [bio] (swap! events conj [:bio-free bio]) 1)
+           #'tls/c-SSL-free
+           (fn [ssl] (swap! events conj [:ssl-free ssl]))
+           #'tls/c-SSL-CTX-free
+           (fn [ctx] (swap! events conj [:ctx-free ctx]))}
+          (fn []
+            (caught
+              #(@#'tls/acquire-engine!
+                 :method (fn [_] nil) (fn [_] nil)))))]
+    (is (= javax.net.ssl.SSLException (class exception)))
+    (is (= [[:bio-free :rbio]
+            [:ssl-free :ssl]
+            [:ctx-free :ctx]]
+           @events))))
+
+(deftest ssl-owns-bios-after-set-bio-transfer
+  (let [events (atom [])
+        bio-results (atom [:rbio :wbio])
+        exception
+        (with-redefs-fn
+          {#'ffi/null? (constantly false)
+           #'tls/c-SSL-CTX-new (fn [_] :ctx)
+           #'tls/c-SSL-new (fn [_] :ssl)
+           #'tls/c-BIO-s-mem (fn [] :bio-method)
+           #'tls/c-BIO-new
+           (fn [_]
+             (let [result (first @bio-results)]
+               (swap! bio-results subvec 1)
+               result))
+           #'tls/c-SSL-set-bio
+           (fn [ssl rbio wbio]
+             (swap! events conj [:set-bio ssl rbio wbio]))
+           #'tls/c-BIO-free
+           (fn [bio] (swap! events conj [:bio-free bio]) 1)
+           #'tls/c-SSL-free
+           (fn [ssl] (swap! events conj [:ssl-free ssl]))
+           #'tls/c-SSL-CTX-free
+           (fn [ctx] (swap! events conj [:ctx-free ctx]))}
+          (fn []
+            (caught
+              #(@#'tls/acquire-engine!
+                 :method
+                 (fn [_] nil)
+                 (fn [_]
+                   (throw (ex-info "configuration failed after transfer" {})))))))]
+    (is (= "configuration failed after transfer" (ex-message exception)))
+    (is (= [[:set-bio :ssl :rbio :wbio]
+            [:ssl-free :ssl]
+            [:ctx-free :ctx]]
+           @events))
+    (is (zero? (event-count @events [:bio-free :rbio])))
+    (is (zero? (event-count @events [:bio-free :wbio])))))
