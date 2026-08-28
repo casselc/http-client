@@ -1,4 +1,4 @@
-{:paths ["src"]
+{:paths ["src" "resources"]
 
  ;; clj-http-lite straight from its git repo. Jolt ignores the org.clojure/clojure
  ;; dependency it declares; this library supplies the JVM host APIs clj-http-lite

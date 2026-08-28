@@ -192,6 +192,7 @@
       (and (= m :head) (= uri "/head")) {:status 200 :body ""}
       (and (= m :get) (= uri "/content-type")) {:status 200 :body (or (get h "content-type") "")}
       (and (= m :get) (= uri "/header")) {:status 200 :body (or (get h "x-my-header") "")}
+      (and (= m :get) (= uri "/traceparent")) {:status 200 :body (or (get h "traceparent") "")}
       (and (= m :post) (= uri "/post")) {:status 200 :body (:body-raw req)}
       (and (= m :get) (= uri "/redirect")) {:status 302 :headers {"Location" "/get"} :body ""}
       (and (= m :get) (= uri "/error")) {:status 500 :body "o noes"}
