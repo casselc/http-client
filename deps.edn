@@ -14,7 +14,7 @@
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
         io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "0c3e085f43b90b346be9843e43448c890f8b701d"}
+         :git/sha "ba040f1f2a664e72c9d650f7f8ca8b17368ec89c"}
         jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
                                :git/sha "8a3247f698fbd462cddae9b206a7e3b3aac1bb92"}}
 
@@ -28,13 +28,6 @@
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "jolt.http.test-runner"]}
-           ;; Exercise the locally migrated dependency chain before its new
-           ;; jolt-net/jolt-tcp commits have published Git SHAs.
-           :workspace
-           {:override-deps {io.github.casselc/jolt-tcp
-                            {:local/root "../jolt-tcp"}
-                            io.github.casselc/jolt-net
-                            {:local/root "../jolt-net"}}}
            ;; https read-timeout + OpenSSL symbol-pinning regressions. Separate
            ;; process: they stall a connection on purpose and stand up their own
            ;; servers, which the main suite's serial accept loop doesn't tolerate.
@@ -49,5 +42,5 @@
                      :extra-deps {org.babashka/http-client {:mvn/version "0.4.23"}}
                      :main-opts ["-m" "jolt.http.babashka-test"]}}
 
- :tasks {test "jolt -A:workspace -M:test"
-         timeouttest "jolt -A:workspace -M:timeouttest"}}
+ :tasks {test "jolt -M:test"
+         timeouttest "jolt -M:timeouttest"}}
