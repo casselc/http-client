@@ -65,9 +65,12 @@ unbounded behavior. That compatibility setting is process-wide.
 
 ## Requirements
 
-- Jolt 0.7.28 or newer. This release supplies the scoped native-allocation,
-  host byte-stream, and native transport APIs used by the library and its
-  pinned dependencies.
+- Jolt 0.8.0 or newer. This library uses the value-first `jolt.ffi/write`
+  signature introduced in 0.8.0. The floor is declared as `:jolt/min-version`
+  so supported runtimes reject an incompatible dependency graph before a native
+  buffer can be written with the old offset-first interpretation. It also
+  relies on the scoped native-allocation, host byte-stream, and native transport
+  APIs supplied by the current runtime and pinned dependencies.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests

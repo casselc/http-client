@@ -1,6 +1,7 @@
 (ns jolt.http.zlib-test
   "Isolated libz round-trip check (no clj-http-lite / sockets)."
-  (:require [jolt.http.zlib :as zlib]))
+  (:require [jolt.ffi :as ffi]
+            [jolt.http.zlib :as zlib]))
 
 (def failures (atom 0))
 (defn check [label ok?]
@@ -12,6 +13,15 @@
 
 (defn -main [& _]
   (println "jolt.http.zlib over libz")
+  ;; The four-argument API is (pointer type value offset). Both trailing
+  ;; arguments are integers here so this detects accidentally restoring the
+  ;; pre-0.8 offset-first spelling, which otherwise writes valid-looking data
+  ;; to the wrong address without a type error.
+  (let [p (ffi/alloc 128)]
+    (try
+      (ffi/write p :uint8 0x5a 3)
+      (check "ffi/write places value before offset" (= 0x5a (ffi/read p :uint8 3)))
+      (finally (ffi/free p))))
   (let [msg (apply str (repeat 200 "the quick brown fox jumps over the lazy dog. "))
         src (->ba msg)]
     ;; gzip framing: output starts with the gzip magic 1f 8b and round-trips.
