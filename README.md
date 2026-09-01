@@ -56,12 +56,10 @@ applies process-wide, and is nil (uncapped) by default.
 
 ## Requirements
 
-- jolt 0.7.19 or newer. `jolt.http.net` reads errno through `jolt.io-poller`,
-  which older jolts lack (namespace load fails with `Could not locate
-  jolt/io_poller`), and 0.7.19 is where jolt's own java.io byte streams answer
-  the full surface — so this library hands back jolt's classes instead of
-  registering process-wide `ByteArrayInputStream`/`ByteArrayOutputStream`
-  shims.
+- jolt 0.8.0 or newer. This library uses the value-first `jolt.ffi/write`
+  signature introduced in 0.8.0. The floor is declared as `:jolt/min-version`
+  so supported runtimes reject an incompatible dependency graph before a native
+  buffer can be written with the old offset-first interpretation.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests
