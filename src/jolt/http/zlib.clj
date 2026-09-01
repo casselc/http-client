@@ -37,10 +37,10 @@
         strm    (ffi/alloc ZS)
         src-buf (ffi/alloc (max 1 n))
         out-buf (ffi/alloc CHUNK)]
-    (dotimes [i ZS] (ffi/write strm :uint8 i 0))
+    (dotimes [i ZS] (ffi/write strm :uint8 0 i))
     (ffi/write-array src-buf src)
-    (ffi/write strm :pointer O-next-in src-buf)
-    (ffi/write strm :uint O-avail-in n)
+    (ffi/write strm :pointer src-buf O-next-in)
+    (ffi/write strm :uint n O-avail-in)
     [strm src-buf out-buf]))
 
 (defn deflate-bytes
@@ -52,8 +52,8 @@
         (throw (ex-info "zlib: deflateInit2 failed" {})))
       (let [chunks
             (loop [acc []]
-              (ffi/write strm :pointer O-next-out out-buf)
-              (ffi/write strm :uint O-avail-out CHUNK)
+              (ffi/write strm :pointer out-buf O-next-out)
+              (ffi/write strm :uint CHUNK O-avail-out)
               (let [r (c-deflate strm Z-FINISH)
                     produced (- CHUNK (ffi/read strm :uint O-avail-out))
                     acc (if (pos? produced) (conj acc (ffi/read-array out-buf produced)) acc)]
@@ -74,8 +74,8 @@
         (throw (ex-info "zlib: inflateInit2 failed" {})))
       (let [chunks
             (loop [acc []]
-              (ffi/write strm :pointer O-next-out out-buf)
-              (ffi/write strm :uint O-avail-out CHUNK)
+              (ffi/write strm :pointer out-buf O-next-out)
+              (ffi/write strm :uint CHUNK O-avail-out)
               (let [r (c-inflate strm Z-NO-FLUSH)
                     produced (- CHUNK (ffi/read strm :uint O-avail-out))
                     acc (if (pos? produced) (conj acc (ffi/read-array out-buf produced)) acc)]
