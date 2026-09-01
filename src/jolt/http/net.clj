@@ -85,8 +85,8 @@
   ;; as an error rather than risk calling a dead socket connected.
   (let [err (ffi/alloc 4) len (ffi/alloc 4)]
     (try
-      (ffi/write err :int 0 0)
-      (ffi/write len :uint 0 4)
+      (ffi/write err :int 0)
+      (ffi/write len :uint 4)
       (if (neg? (c-getsockopt fd sol-socket so-error err len))
         -1
         (ffi/read err :int))
@@ -107,9 +107,9 @@
         ;; jolt.ffi has no 16-bit type, so events and revents are set by one :int
         ;; write: little-endian puts events in the low half, revents (already
         ;; zeroed) in the high half.
-        (dotimes [i 8] (ffi/write pf :uint8 i 0))
-        (ffi/write pf :int 0 fd)
-        (ffi/write pf :int 4 po-pollout)
+        (dotimes [i 8] (ffi/write pf :uint8 0 i))
+        (ffi/write pf :int fd)
+        (ffi/write pf :int po-pollout 4)
         (let [pr (c-poll pf 1 (int timeout-ms))]
           (cond
             ;; writable — the connect either completed or failed; SO_ERROR tells.
@@ -145,8 +145,8 @@
          ;; hints: ai_socktype = SOCK_STREAM, else getaddrinfo also returns UDP
          ;; entries and connect() on a datagram socket spuriously "succeeds".
          hints   (ffi/alloc 48)]
-     (dotimes [i 48] (ffi/write hints :uint8 i 0))
-     (ffi/write hints :int O-ai-socktype 1)   ; SOCK_STREAM
+     (dotimes [i 48] (ffi/write hints :uint8 0 i))
+     (ffi/write hints :int 1 O-ai-socktype)   ; SOCK_STREAM
      (try
        (let [rc (c-getaddrinfo node service hints respp)]
          (when-not (zero? rc)
@@ -190,9 +190,9 @@
   (when (and ms (pos? ms))
     ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 16 bytes LP64.
     (let [tv (ffi/alloc 16)]
-      (dotimes [i 16] (ffi/write tv :uint8 i 0))
-      (ffi/write tv :long 0 (quot ms 1000))
-      (ffi/write tv :long 8 (* (rem ms 1000) 1000))
+      (dotimes [i 16] (ffi/write tv :uint8 0 i))
+      (ffi/write tv :long (quot ms 1000))
+      (ffi/write tv :long (* (rem ms 1000) 1000) 8)
       (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
       (ffi/free tv))))
 
