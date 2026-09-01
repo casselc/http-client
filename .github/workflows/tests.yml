@@ -1,8 +1,8 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.7.27: it supplies the host byte-stream and native transport APIs
-# used by this library and the published jolt-tcp/jolt-net dependency graph.
+# floor is 0.8.0: it supplies the value-first FFI write contract used by this
+# library and its published crypto/TCP/net dependency graph.
 #
 # Raise the pin as new jolt releases land.
 
@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      JOLT_VERSION: '0.7.27'
+      JOLT_VERSION: '0.8.0'
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt

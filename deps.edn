@@ -17,8 +17,8 @@
         io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
          :git/sha "85f67fb76c4c6d392f5dd51821e458d446ebae01"}
-        jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "8a3247f698fbd462cddae9b206a7e3b3aac1bb92"}}
+        jolt-lang/jolt-crypto {:git/url "https://github.com/casselc/jolt-crypto.git"
+                               :git/sha "8bd234142d56dd75d36d58065a311f29fa08611e"}}
 
  ;; jolt-tcp owns the transitive platform socket declarations. libssl/libcrypto
  ;; come from jolt-crypto; this project declares only libz directly.
