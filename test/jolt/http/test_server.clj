@@ -34,13 +34,13 @@
 
 (defn- make-sockaddr [port]
   (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
+    (dotimes [i 16] (ffi/write sa :uint8 0 i))
     (if macos?
-      (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 AF-INET))
-      (ffi/write sa :uint8 0 AF-INET))
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
-    (ffi/write sa :uint8 3 (bit-and port 0xff))
-    (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 7 1)   ; 127.0.0.1
+      (do (ffi/write sa :uint8 16) (ffi/write sa :uint8 AF-INET 1))
+      (ffi/write sa :uint8 AF-INET))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)
+    (ffi/write sa :uint8 127 4) (ffi/write sa :uint8 1 7)   ; 127.0.0.1
     sa))
 
 (defn listen-socket
@@ -51,7 +51,7 @@
      (try
        (let [opt (ffi/alloc 4)]
          (try
-           (ffi/write opt :int 0 1)
+           (ffi/write opt :int 1)
            (c-setsockopt fd sol-socket so-reuse opt 4)
            (finally (ffi/free opt))))
        (let [sa (make-sockaddr port)]
@@ -73,7 +73,7 @@
     (try
       (let [lenp (ffi/alloc 4)]
         (try
-          (ffi/write lenp :uint 0 16)
+          (ffi/write lenp :uint 16)
           (when (neg? (c-getsockname fd sa lenp))
             (throw (ex-info "getsockname() failed" {:fd fd})))
           (+ (bit-shift-left (ffi/read sa :uint8 2) 8)
@@ -99,7 +99,7 @@
   (when macos?
     (let [opt (ffi/alloc 4)]
       (try
-        (ffi/write opt :int 0 1)
+        (ffi/write opt :int 1)
         (c-setsockopt fd sol-socket so-nosigpipe opt 4)
         (finally (ffi/free opt)))))
   fd)
