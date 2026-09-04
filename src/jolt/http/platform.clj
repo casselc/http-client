@@ -271,18 +271,29 @@
     (let [head (byte-array (.getBytes (.toString sb) "UTF-8"))]
       (if body (concat-ba head (->bytes body)) head))))
 
+(defn- url-origin [url]
+  (str (tget url :protocol) "://"
+       (or (tget url :userinfo) "")
+       (when (tget url :userinfo) "@")
+       (tget url :host)
+       (let [p (tget url :port)]
+         (if (and (number? p) (>= p 0)) (str ":" p) ""))))
+
 (defn- resolve-location [base loc]
-  (cond
-    (or (str/starts-with? loc "http://") (str/starts-with? loc "https://")) (parse-url loc)
-    (str/starts-with? loc "//") (parse-url (str (tget base :protocol) ":" loc))
-    (str/starts-with? loc "/")
-      (parse-url (str (tget base :protocol) "://"
-                      (or (tget base :userinfo) "")
-                      (when (tget base :userinfo) "@")
-                      (tget base :host)
-                      (let [p (tget base :port)] (if (and (number? p) (>= p 0)) (str ":" p) ""))
-                      loc))
-    :else (parse-url (str (tget base :protocol) "://" (tget base :host) "/" loc))))
+  (let [base-path (let [p (tget base :path)]
+                    (if (or (nil? p) (= "" p)) "/" p))]
+    (cond
+      (or (str/starts-with? loc "http://") (str/starts-with? loc "https://")) (parse-url loc)
+      (str/starts-with? loc "//") (parse-url (str (tget base :protocol) ":" loc))
+      (str/starts-with? loc "/")
+        (parse-url (str (url-origin base) loc))
+      ;; An empty-path reference retains the current path and replaces its query.
+      (str/starts-with? loc "?")
+        (parse-url (str (url-origin base) base-path loc))
+      :else
+      (let [slash (or (str/last-index-of base-path "/") -1)
+            directory (subs base-path 0 (inc slash))]
+        (parse-url (str (url-origin base) directory loc))))))
 
 (def ^:private redirect-statuses #{301 302 303 307 308})
 (declare timeout-error?)
