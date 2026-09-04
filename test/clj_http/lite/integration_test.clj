@@ -80,6 +80,16 @@
     (is (= 200 (:status resp)))
     (is (= "get" (slurp-body resp)))))
 
+(deftest auto-follows-path-relative-redirect
+  (let [resp (request {:request-method :get :uri "/nested/redirect"})]
+    (is (= 200 (:status resp)))
+    (is (= "relative-get" (slurp-body resp)))))
+
+(deftest auto-follows-query-only-redirect
+  (let [resp (request {:request-method :get :uri "/nested/query-redirect"})]
+    (is (= 200 (:status resp)))
+    (is (= "query-get" (slurp-body resp)))))
+
 (deftest sets-conn-timeout
   ;; indirect way of testing if a connection timeout will fail by passing in an
   ;; invalid argument

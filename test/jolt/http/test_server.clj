@@ -167,7 +167,8 @@
                               m)))
                         {} (rest lines))]
     {:request-method (keyword (str/lower-case method))
-     :uri uri :headers headers :body-raw rest-body
+     :uri uri :query-string (when qi (subs target (inc qi)))
+     :headers headers :body-raw rest-body
      :content-length (or (parse-long (or (get headers "content-length") "")) 0)}))
 
 ;; read a full request (headers + content-length body) as a latin1 string, or nil.
@@ -195,6 +196,13 @@
       (and (= m :get) (= uri "/traceparent")) {:status 200 :body (or (get h "traceparent") "")}
       (and (= m :post) (= uri "/post")) {:status 200 :body (:body-raw req)}
       (and (= m :get) (= uri "/redirect")) {:status 302 :headers {"Location" "/get"} :body ""}
+      (and (= m :get) (= uri "/nested/redirect"))
+        {:status 302 :headers {"Location" "target"} :body ""}
+      (and (= m :get) (= uri "/nested/target")) {:status 200 :body "relative-get"}
+      (and (= m :get) (= uri "/nested/query-redirect")
+           (= "page=2" (:query-string req))) {:status 200 :body "query-get"}
+      (and (= m :get) (= uri "/nested/query-redirect"))
+        {:status 302 :headers {"Location" "?page=2"} :body ""}
       (and (= m :get) (= uri "/error")) {:status 500 :body "o noes"}
       (and (= m :get) (= uri "/timeout")) (do (Thread/sleep 100) {:status 200 :body "timeout"})
       (and (= m :delete) (= uri "/delete-with-body")) {:status 200 :body "delete-with-body"}
