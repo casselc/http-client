@@ -26,6 +26,8 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/jolt-lang/jolt/v${JOLT_VERSION}/install" \
             | bash -s -- --dir "$HOME/.jolt" --version "$JOLT_VERSION"
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
+      - name: Canonical dependency graph
+        run: bash test/dependency-resolution.sh jolt
       - name: Main suite
         run: JOLT_PWD="$PWD" jolt -M:test
       - name: Timeout suite
