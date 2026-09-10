@@ -13,10 +13,12 @@ else
 fi
 crypto_sha=5effcc89a3258499a79a2a3d69edad9e7800d1bf
 canonical_repo_path=/jolt-lang/jolt-crypto
+canonical_cache_path=/https___github.com_jolt-lang_jolt-crypto
 
 matches_selected_crypto() {
   local path=$1
-  [[ $path == *${canonical_repo_path}/${crypto_sha}/src ]]
+  [[ $path == *${canonical_repo_path}/${crypto_sha}/src ||
+     $path == *${canonical_cache_path}/${crypto_sha}/src ]]
 }
 
 classpath=$("${jolt_cmd[@]}" -Srepro -Spath)
@@ -42,6 +44,11 @@ fi
 if matches_selected_crypto \
   "/tmp/casselc/jolt-crypto/${crypto_sha}/src"; then
   echo 'wrong-repository control unexpectedly matched' >&2
+  exit 1
+fi
+if ! matches_selected_crypto \
+  "/tmp${canonical_cache_path}/${crypto_sha}/src"; then
+  echo 'hosted canonical-cache control unexpectedly failed' >&2
   exit 1
 fi
 if matches_selected_crypto \
