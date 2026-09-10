@@ -70,7 +70,10 @@ unbounded behavior. That compatibility setting is process-wide.
   so supported runtimes reject an incompatible dependency graph before a native
   buffer can be written with the old offset-first interpretation. It also
   relies on the scoped native-allocation, host byte-stream, and native transport
-  APIs supplied by the current runtime and pinned dependencies.
+  APIs supplied by the current runtime and pinned dependencies. `jolt-crypto`
+  resolves once from its canonical `jolt-lang` repository at a full reviewed
+  revision; `test/dependency-resolution.sh` fails if the selected graph drifts
+  to a fork, another revision, or two repository identities.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Tests
@@ -93,4 +96,5 @@ tests in addition to clj-http-lite's integration suite. Additional suites are:
 jolt -M:timeouttest   # timeout/deadline regressions
 jolt -M:bhctest       # babashka.http-client compatibility
 jolt -M:zlibtest      # zlib round-trip, no sockets
+bash test/dependency-resolution.sh jolt # canonical selected dependency graph
 ```
