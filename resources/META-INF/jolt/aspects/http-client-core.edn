@@ -1,0 +1,9 @@
+{:schema 1
+ :library {:id jolt-lang/http-client
+           :version "v0.0.10+http-client-core-aspect.1"}
+ :aspects
+ [{:id :http-client.core/request
+   :match {:entry clj-http.lite.core/request
+           :arity 1}
+   :advice-role :http/client
+   :expect {:matches 1}}]}

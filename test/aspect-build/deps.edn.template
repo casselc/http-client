@@ -1,0 +1,10 @@
+{:paths ["src" "resources"]
+
+ :deps {io.github.casselc/http-client
+        {:local/root "@HTTP_CLIENT_ROOT@"}}
+
+ :jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/http-client-core.edn"
+    :provider jolt.http.aspect-fixture/aspect-provider}]
+  :aspect-report "target/aspects.edn"}}

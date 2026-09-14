@@ -9,7 +9,14 @@
 (def ^:private https-port 18092)
 
 (defn launch []
-  (let [pwd  (jolt.host/getenv "JOLT_PWD")
+  ;; JOLT_PWD is set by CI but not by an interactive `jolt -M:test` — without
+  ;; the user.dir fallback the cert path becomes "/test/resources/cert.pem",
+  ;; SSL_CTX_use_certificate_file fails, and the TLS server closes every
+  ;; connection during the handshake. self-signed-ssl-get then passes its
+  ;; thrown? vacuously and crashes on the insecure request, wearing whatever
+  ;; exception class the close happened to produce (RST vs clean EOF) — which
+  ;; read as an intermittent TLS flake for a long time.
+  (let [pwd  (or (jolt.host/getenv "JOLT_PWD") (System/getProperty "user.dir"))
         cert (str pwd "/test/resources/cert.pem")
         key  (str pwd "/test/resources/key.pem")
         plain (srv/start-plain http-port)
