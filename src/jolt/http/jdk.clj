@@ -431,22 +431,27 @@
         req (str "CONNECT " target " HTTP/1.1\r\n"
                  "Host: " target "\r\n"
                  "Proxy-Connection: keep-alive\r\n\r\n")]
-    (net/send-bytes fd (core/latin1->ba req))
-    (loop [acc ""]
-      (if-let [chunk (net/recv-bytes fd)]
-        (let [acc (str acc (core/ba->latin1 chunk))]
-          (if-let [end (str/index-of acc "\r\n\r\n")]
-            (let [status-line (first (str/split (subs acc 0 end) #"\r\n"))
-                  status (parse-long (or (nth (str/split status-line #" ") 1 nil) ""))]
-              (when-not (= 200 status)
-                (net/close fd)
-                (throw-typed "java.io.IOException"
-                             (str "proxy CONNECT to " target " failed: " status-line)))
-              nil)
-            (recur acc)))
-        (do (net/close fd)
-            (throw-typed "java.io.IOException"
-                         (str "proxy closed the connection during CONNECT to " target)))))))
+    ;; This function owns the newly connected fd until CONNECT succeeds. Every
+    ;; failure, including an interrupt in a sliced write/read wait, retires it;
+    ;; cleanup failure must not replace the primary transport exception.
+    (try
+      (net/send-bytes fd (core/latin1->ba req))
+      (loop [acc ""]
+        (if-let [chunk (net/recv-bytes fd)]
+          (let [acc (str acc (core/ba->latin1 chunk))]
+            (if-let [end (str/index-of acc "\r\n\r\n")]
+              (let [status-line (first (str/split (subs acc 0 end) #"\r\n"))
+                    status (parse-long (or (nth (str/split status-line #" ") 1 nil) ""))]
+                (when-not (= 200 status)
+                  (throw-typed "java.io.IOException"
+                               (str "proxy CONNECT to " target " failed: " status-line)))
+                nil)
+              (recur acc)))
+          (throw-typed "java.io.IOException"
+                       (str "proxy closed the connection during CONNECT to " target))))
+      (catch Throwable primary
+        (try (net/close fd) (catch Throwable _ nil))
+        (throw primary)))))
 
 (defn- open-stream
   "Connect to the request's origin, honouring `prx` ({:host :port} or nil).

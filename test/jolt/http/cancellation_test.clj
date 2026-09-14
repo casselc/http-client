@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [jolt.http-client :as http]
             [jolt.http.core :as core]
+            [jolt.http.jdk]
             [jolt.http.net :as net]
             [jolt.http.platform]
             [jolt.io-poller]
@@ -299,6 +300,58 @@
             ;; The production check normally clears it; keep the runner clean if
             ;; the assertion itself fails before reaching that check.
             (Thread/interrupted)))))))
+
+(deftest poll-errno-is-captured-before-the-post-poll-clock-read
+  (let [await-var (private-var 'jolt.http.net 'await-ready!)
+        pollout (var-get (private-var 'jolt.http.net 'po-pollout))
+        poll-var (private-var 'jolt.http.net 'c-poll)
+        errno-var (private-var 'jolt.io-poller 'errno)
+        clock-var (private-var 'jolt.http.net 'current-time-ms)
+        eintr (var-get (private-var 'jolt.http.net 'eintr))
+        events (atom [])
+        polls (atom 0)]
+    (with-redefs-fn
+      {clock-var (fn [] (swap! events conj :clock) 100)
+       poll-var (fn [& _]
+                  (swap! events conj :poll)
+                  (if (= 1 (swap! polls inc)) -1 1))
+       errno-var (fn [] (swap! events conj :errno) eintr)}
+      (fn []
+        (is (nil? (@await-var 41 pollout 1000 "connect")))
+        (is (= [:clock :poll :errno :clock :clock :poll]
+               @events)
+            "errno is read before any post-poll clock/runtime call")))))
+
+(deftest proxy-connect-failure-closes-once-and-preserves-the-primary
+  (let [proxy-connect-var (private-var 'jolt.http.jdk 'proxy-connect!)
+        send-var (private-var 'jolt.http.net 'send-bytes)
+        recv-var (private-var 'jolt.http.net 'recv-bytes)
+        close-var (private-var 'jolt.http.net 'close)]
+    (doseq [failure-at [:send :recv]]
+      (let [primary (ex-info (str failure-at " interrupted") {:at failure-at})
+            closes (atom 0)
+            receives (atom 0)
+            caught
+            (with-redefs-fn
+              {send-var (fn [& _]
+                          (when (= :send failure-at) (throw primary))
+                          nil)
+               recv-var (fn [& _]
+                          (swap! receives inc)
+                          (throw primary))
+               close-var (fn [_]
+                           (swap! closes inc)
+                           (throw (ex-info "cleanup failed" {})))}
+              (fn []
+                (try
+                  (@proxy-connect-var 41 "origin.example" 443)
+                  :returned
+                  (catch Throwable error error))))]
+        (is (identical? primary caught)
+            (str failure-at " cleanup cannot replace the primary failure"))
+        (is (= 1 @closes) (str failure-at " closes the owned fd exactly once"))
+        (is (= (if (= :recv failure-at) 1 0) @receives)
+            (str failure-at " performs no transport operation after failure"))))))
 
 (deftest interrupted-pooled-write-closes-once-and-is-never-replayed
   (let [perform-var (private-var 'jolt.http.platform 'perform!)

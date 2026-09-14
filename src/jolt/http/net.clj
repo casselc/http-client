@@ -111,6 +111,8 @@
   (when (Thread/interrupted)
     (conn-ex "java.lang.InterruptedException" (str operation " interrupted"))))
 
+(defn- current-time-ms [] (System/currentTimeMillis))
+
 (defn- await-ready!
   "Wait for EVENTS on fd in interruptible slices. DEADLINE is an absolute wall
   clock millisecond or nil. Returns nil when ready and :timeout at the deadline.
@@ -126,18 +128,22 @@
         ;; Interruption wins when it races the deadline, consistently with the
         ;; existing read path and java.lang.InterruptedException conventions.
         (check-interrupted! operation)
-        (let [now (System/currentTimeMillis)]
+        (let [now (current-time-ms)]
           (if (and deadline (>= now deadline))
             :timeout
             (let [slice (if deadline
                           (min interrupt-slice-ms (max 0 (- deadline now)))
                           interrupt-slice-ms)
-                  pr (c-poll pf 1 (int slice))]
+                  pr (c-poll pf 1 (int slice))
+                  ;; errno belongs to the immediately preceding native call.
+                  ;; Capture it before even consulting the clock: another FFI or
+                  ;; runtime call is allowed to overwrite the thread-local value.
+                  err (when (neg? pr) (poller/errno))]
               (cond
                 (pos? pr) nil
-                (and deadline (>= (System/currentTimeMillis) deadline)) :timeout
+                (and deadline (>= (current-time-ms) deadline)) :timeout
                 (zero? pr) (recur)
-                (= (poller/errno) eintr) (recur)
+                (= err eintr) (recur)
                 :else (conn-ex "java.io.IOException" "poll failed"))))))
       (finally (ffi/free pf)))))
 
