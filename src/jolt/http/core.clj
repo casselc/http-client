@@ -609,6 +609,14 @@
         (and (= "class javax.net.ssl.SSLException" class-name)
              (= tls/unexpected-transport-eof-message (ex-message t))))))
 
+(defn idempotent-method?
+  "True for the HTTP methods RFC 9110 defines as idempotent. Only these may be
+  replayed when a pooled connection dies after the request is written but before
+  any response byte arrives."
+  [method]
+  (contains? #{"DELETE" "GET" "HEAD" "OPTIONS" "PUT" "TRACE"}
+             (str/upper-case (str method))))
+
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it
   is framed. `deadline` is an absolute System/currentTimeMillis bound on the

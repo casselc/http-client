@@ -537,9 +537,9 @@
   live one until the exchange fails, and it fails differently depending on the
   platform — a clean EOF where the peer sent FIN, a reset where it sent RST,
   which is what Linux does when it closes a socket with unread data. Either way
-  the test is the same: did any response byte arrive? If none did, the peer
-  cannot have acted on the request, so it is retried on a fresh connection, and
-  that is safe even for a POST."
+  the safe test is: is the method idempotent, and did any response byte arrive?
+  Only then is it retried fresh. A peer may process a POST and close before its
+  response arrives, so a non-idempotent request is never replayed here."
   [{:keys [url method read-timeout conn-timeout insecure? proxy ssl] :as req}]
   (let [https? (= "https" (tget url :protocol))
         port (core/effective-port url)
@@ -556,7 +556,9 @@
           (core/set-stream-timeout! pooled read-timeout)
           (exchange-once pooled (boolean (and proxy (not https?))) key req received)
           (catch Throwable t
-            (if (and (not @received) (core/connection-gone? t))
+            (if (and (core/idempotent-method? method)
+                     (not @received)
+                     (core/connection-gone? t))
               (fresh!)
               (throw t)))))
       (fresh!))))

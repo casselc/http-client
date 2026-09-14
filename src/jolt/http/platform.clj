@@ -81,12 +81,14 @@
           resp (if-let [pooled (core/pool-acquire key)]
                  ;; a connection the peer retired since the last request fails
                  ;; before answering — cleanly or with a reset, depending on the
-                 ;; platform. Nothing received means nothing was acted on, so it
-                 ;; is retried fresh.
+                 ;; platform. An idempotent request with no response bytes may
+                 ;; be retried fresh; replaying POST here could duplicate work.
                  (let [received (atom false)]
                    (try (once (core/set-stream-timeout! pooled (tget conn :read-timeout)) received)
                         (catch Throwable t
-                          (if (and (not @received) (core/connection-gone? t))
+                          (if (and (core/idempotent-method? method)
+                                   (not @received)
+                                   (core/connection-gone? t))
                             (once (open!) (atom false))
                             (throw t)))))
                  (once (open!) (atom false)))

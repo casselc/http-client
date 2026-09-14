@@ -320,6 +320,12 @@
                  (typed "javax.net.ssl.SSLException"
                         "certificate verification failed"))))))
 
+(deftest only-idempotent-methods-may-replay-after-a-stale-connection
+  (doseq [method ["DELETE" "GET" "HEAD" "OPTIONS" "PUT" "TRACE" "get"]]
+    (is (core/idempotent-method? method) (str method " is idempotent")))
+  (doseq [method ["CONNECT" "PATCH" "POST" nil]]
+    (is (not (core/idempotent-method? method)) (str method " is not replayable"))))
+
 (defn- truncating-handler
   "Answers the first request on a connection; on the next one sends headers and
   then hangs up mid-body."

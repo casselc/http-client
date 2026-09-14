@@ -15,8 +15,9 @@
   only `close_notify` as clean TLS EOF, so framed-complete raw closes succeed
   without an extra read and truncated or close-delimited raw closes fail. A raw
   close on a reused TLS connection before any response byte is classified
-  narrowly as a stale pooled socket and retried fresh; unrelated TLS failures
-  and every mid-response truncation still surface to the caller.
+  narrowly as a stale pooled socket. Idempotent methods retry fresh, while POST
+  and other non-idempotent requests surface the failure rather than risk replay;
+  unrelated TLS failures and every mid-response truncation also surface.
 
 - Resolve `jolt-crypto` from its canonical `jolt-lang` repository at the
   reviewed Jolt 0.8 provider/value-first revision, with a fail-closed selected

@@ -87,7 +87,7 @@
        (str/includes? (str (ex-message error))
                       "transport closed without TLS close_notify")))
 
-(defn- start-stale-pooled-tls [port]
+(defn- start-stale-pooled-tls [port accept-retry?]
   (let [fd (srv/listen-socket port)
         requests (atom 0)
         done (promise)
@@ -106,14 +106,18 @@
           (read-tls-request-head! stream)
           (swap! requests inc)
           (net/close raw))
-        ;; The retry must open a fresh TLS connection and send the request once.
-        (let [raw (srv/accept-raw fd)
-              stream (tls/tls-wrap-server raw cert key)
-              write (jolt.host/ref-get stream :write)]
-          (read-tls-request-head! stream)
-          (swap! requests inc)
-          (write stream (core/latin1->ba response))
-          ((jolt.host/ref-get stream :close) stream))
+        ;; For an idempotent request the retry must open a fresh TLS connection.
+        ;; A non-idempotent control deliberately leaves no accept outstanding:
+        ;; any accidental replay therefore cannot complete and the count stays
+        ;; at the two requests the caller intentionally made.
+        (when accept-retry?
+          (let [raw (srv/accept-raw fd)
+                stream (tls/tls-wrap-server raw cert key)
+                write (jolt.host/ref-get stream :write)]
+            (read-tls-request-head! stream)
+            (swap! requests inc)
+            (write stream (core/latin1->ba response))
+            ((jolt.host/ref-get stream :close) stream)))
         (deliver done true)
         (catch Throwable error
           (deliver done error))
@@ -123,7 +127,7 @@
 
 (deftest stale-pooled-tls-transport-eof-retries-before-response
   (let [port 18456
-        server (start-stale-pooled-tls port)
+        server (start-stale-pooled-tls port true)
         url (str "https://127.0.0.1:" port "/")]
     (core/pool-clear!)
     (try
@@ -136,6 +140,25 @@
       (is (= true (deref (:done server) 3000 ::server-timeout)))
       (is (= 3 @(:requests server))
           "two caller requests produce the raced attempt plus one fresh retry")
+      (finally
+        (core/pool-clear!)
+        (try (net/close (:fd server)) (catch Throwable _ nil))))))
+
+(deftest stale-pooled-tls-does-not-replay-post
+  (let [port 18457
+        server (start-stale-pooled-tls port false)
+        url (str "https://127.0.0.1:" port "/")
+        opts {:insecure? true :socket-timeout 3000}]
+    (core/pool-clear!)
+    (try
+      (is (= "ok" (some-> (http/post url opts) :body core/ba->latin1)))
+      (is (= 1 (core/pool-count)) "the first TLS connection is pooled")
+      (let [error (try (http/post url opts) nil (catch Throwable t t))]
+        (is (unexpected-tls-eof? error)
+            (str "POST must surface the stale connection, got " error)))
+      (is (= true (deref (:done server) 3000 ::server-timeout)))
+      (is (= 2 @(:requests server))
+          "the server observes each caller POST exactly once and no replay")
       (finally
         (core/pool-clear!)
         (try (net/close (:fd server)) (catch Throwable _ nil))))))
