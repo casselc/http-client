@@ -1,6 +1,7 @@
 (ns jolt.http.cancellation-test
   (:require [clojure.test :refer [deftest is]]
             [jolt.http-client :as http]
+            [jolt.http.net :as net]
             [jolt.socket]))
 
 (defn- close-quietly [value]
@@ -60,3 +61,57 @@
         (close-quietly @peer)
         (close-quietly listener)
         (.join worker 2000)))))
+
+(deftest interruption-happens-after-the-response-wait-is-entered
+  (let [poll-var (ns-resolve 'jolt.http.net 'c-poll)
+        original-poll @poll-var
+        wait-entered (promise)
+        release-wait (promise)]
+    (with-redefs-fn
+      {poll-var
+       (fn [pollfd count timeout]
+         (if (= net/interrupt-slice-ms timeout)
+           (do
+             (deliver wait-entered true)
+             (deref release-wait 3000 nil)
+             0)
+           (original-poll pollfd count timeout)))}
+      (fn []
+        (let [listener (java.net.ServerSocket. 0)
+              request-received (promise)
+              peer (atom nil)
+              _acceptor (future
+                          (try
+                            (let [socket (.accept listener)]
+                              (reset! peer socket)
+                              (read-request-head! socket)
+                              (deliver request-received true))
+                            (catch Throwable error
+                              (deliver request-received error))))
+              outcome (promise)
+              worker (Thread.
+                      (fn []
+                        (deliver outcome
+                                 (try
+                                   (http/get
+                                    (str "http://127.0.0.1:"
+                                         (.getLocalPort listener)
+                                         "/get")
+                                    {:socket-timeout 10000})
+                                   :returned
+                                   (catch Throwable error (class error))))))]
+          (try
+            (.start worker)
+            (is (= true (deref request-received 3000 ::not-received))
+                "the peer must consume the complete request")
+            (is (= true (deref wait-entered 3000 ::wait-not-entered))
+                "the selected provider must enter its response-read wait")
+            (.interrupt worker)
+            (deliver release-wait true)
+            (is (= java.lang.InterruptedException
+                   (deref outcome 2000 ::still-blocked)))
+            (finally
+              (deliver release-wait true)
+              (close-quietly @peer)
+              (close-quietly listener)
+              (.join worker 2000))))))))

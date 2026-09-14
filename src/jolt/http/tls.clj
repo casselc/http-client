@@ -61,6 +61,7 @@
 ;; SSL_get_error codes / verify modes / ctrl commands.
 (def ^:private WANT-READ 2)
 (def ^:private WANT-WRITE 3)
+(def ^:private ZERO-RETURN 6)
 (def ^:private VERIFY-NONE 0)
 (def ^:private VERIFY-PEER 1)
 (def ^:private BIO-PENDING 10)
@@ -87,6 +88,7 @@
 (ffi/defcfn c-SSL-read          "SSL_read"          [:pointer :pointer :int] :int)
 (ffi/defcfn c-SSL-write         "SSL_write"         [:pointer :pointer :int] :int)
 (ffi/defcfn c-SSL-get-error     "SSL_get_error"     [:pointer :int] :int)
+(ffi/defcfn c-ERR-clear-error   "ERR_clear_error"   [] :void)
 (ffi/defcfn c-SSL-ctrl          "SSL_ctrl"          [:pointer :int :int64 :pointer] :int64)
 (ffi/defcfn c-SSL-shutdown      "SSL_shutdown"      [:pointer] :int)
 (ffi/defcfn c-SSL-set1-host     "SSL_set1_host"     [:pointer :pointer] :int)
@@ -125,6 +127,13 @@
 (defn- cstr [s] (ffi/string->ptr (str s)))
 
 (defn- bio-pending [bio] (c-BIO-ctrl bio BIO-PENDING 0 ffi/null))
+
+(defn- ssl-read-call [ssl buffer length]
+  ;; SSL_get_error is valid only for the immediately preceding SSL operation on
+  ;; this thread, and OpenSSL requires the error queue to be empty beforehand.
+  (c-ERR-clear-error)
+  (let [got (c-SSL-read ssl buffer length)]
+    [got (when-not (pos? got) (c-SSL-get-error ssl got))]))
 
 ;; Drain ciphertext OpenSSL produced into wbio out to the socket.
 (defn- flush-out [st]
@@ -210,19 +219,38 @@
           (let [tmp (ffi/alloc chunk)]
             (try
               (loop []
-                (let [got (c-SSL-read (jolt.host/ref-get self :ssl) tmp chunk)]
+                (let [ssl (jolt.host/ref-get self :ssl)
+                      [got err] (ssl-read-call ssl tmp chunk)]
                   (if (pos? got)
                     (ffi/read-array tmp got)
-                    (let [err (c-SSL-get-error (jolt.host/ref-get self :ssl) got)]
-                      (cond
-                        (= err WANT-READ) (if (feed-in self) (recur)
-                                              (do (jolt.host/ref-put! self :eof true) nil))
+                    (cond
+                        ;; Only TLS close_notify is a clean end of the plaintext
+                        ;; stream. A raw FIN after WANT_READ is truncation: HTTP
+                        ;; framing may avoid observing it for a complete
+                        ;; Content-Length/chunked/bodyless response, but a
+                        ;; close-delimited or incomplete response must fail.
+                        (= err ZERO-RETURN)
+                        (do (jolt.host/ref-put! self :eof true) nil)
+
+                        (= err WANT-READ)
+                        (if (feed-in self)
+                          (recur)
+                          (throw (ssl-ex
+                                  "transport closed without TLS close_notify")))
+
                         (= err WANT-WRITE) (do (flush-out self) (recur))
-                        :else (do (jolt.host/ref-put! self :eof true) nil))))))
+                      :else (throw (ssl-ex
+                                    (str "TLS read failed (SSL_get_error="
+                                         err ")")))))))
               (finally (ffi/free tmp)))))))
     (jolt.host/ref-put! st :close
       (fn [& _]
-        (try (c-SSL-shutdown ssl) (catch Throwable _ nil))
+        (try
+          (c-SSL-shutdown ssl)
+          ;; SSL_shutdown writes close_notify into the memory BIO. It must reach
+          ;; the transport before the socket closes or the peer sees a raw EOF.
+          (flush-out st)
+          (catch Throwable _ nil))
         (try (net/close sock) (catch Throwable _ nil))
         (try (c-SSL-free ssl) (catch Throwable _ nil))
         ;; the SSL_CTX is NOT freed here: client contexts are shared out of

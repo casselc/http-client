@@ -48,7 +48,10 @@ under `:jolt/native`; jolt loads them before the namespaces are required.
 This fork is an append-only convergence of the request-aspect lineage and
 `jolt-lang/http-client` v0.0.10. It packages exactly one provider-neutral
 `:http-client.core/request` aspect for `clj-http.lite.core/request`; the
-transport, timeout and cancellation behavior otherwise comes from v0.0.10.
+HTTP framing, timeout and cancellation behavior otherwise comes from v0.0.10,
+while strict TLS EOF handling is retained: only `close_notify` is a clean TLS
+EOF. A fully framed response returns without observing a later raw FIN, but an
+incomplete or close-delimited response rejects that FIN as TLS truncation.
 In particular, a thread interrupted during a blocked response read returns
 within the documented 250 ms poll slice instead of waiting for the complete
 socket timeout. The minimum supported runtime remains Jolt 0.8.1.
@@ -186,6 +189,9 @@ jolt -M:cancellationtest # hermetic blocked-read interruption regression
 jolt -M:timeouttest   # timeout/deadline regressions; stalls connections on
                       # purpose. One case loads jolt.nrepl in a subprocess and
                       # fetches https://example.com, so it needs network egress.
+./test/aspect-resolution.sh "$JOLT_ASPECT_JOLT"
+                      # aspect-capable Jolt v0.8.6 compiler: build the real
+                      # request entry once; reject zero/duplicate match mutants
 ```
 
 Values the suites assert on — the bytes `java.net.http` puts on the wire, what

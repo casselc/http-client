@@ -4,9 +4,10 @@
   Both were invisible to the existing suite because it exercises the TLS path
   only against a server that answers promptly, in a process where nothing else
   had touched jolt.ffi first."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [jolt.process :as p]
+            [jolt.http.core :as core]
             [jolt.http.net :as net]
             [jolt.http.tls :as tls]
             [jolt.http.platform :as platform]
@@ -38,6 +39,108 @@
                            (catch Throwable _ nil))))
             (recur)))))
     {:fd fd :port port :running running? :held held}))
+
+(defn- read-tls-request-head! [stream]
+  (let [read (jolt.host/ref-get stream :read)]
+    (loop [received ""]
+      (if (str/includes? received "\r\n\r\n")
+        true
+        (if-let [bytes (read stream nil)]
+          (recur (str received (core/ba->latin1 bytes)))
+          (throw (ex-info "peer closed before sending a complete request" {})))))))
+
+(defn- start-one-shot-tls-response [port response close-kind]
+  (let [fd (srv/listen-socket port)
+        done (promise)]
+    (future
+      (let [raw (srv/accept-raw fd)]
+        (try
+          (let [stream (tls/tls-wrap-server raw cert key)
+                write (jolt.host/ref-get stream :write)]
+            (read-tls-request-head! stream)
+            (write stream (core/latin1->ba response))
+            (case close-kind
+              :tls ((jolt.host/ref-get stream :close) stream)
+              :raw (net/close raw))
+            (deliver done true))
+          (catch Throwable error
+            (deliver done error))
+          (finally
+            (try (net/close fd) (catch Throwable _ nil))))))
+    {:port port :fd fd :done done}))
+
+(defn- tls-response [port response close-kind]
+  (let [server (start-one-shot-tls-response port response close-kind)]
+    (try
+      (let [result (try
+                     {:response
+                      (http/get (str "https://127.0.0.1:" port "/")
+                                {:insecure? true :socket-timeout 3000})}
+                     (catch Throwable error {:error error}))]
+        (deref (:done server) 3000 ::server-timeout)
+        result)
+      (finally
+        (try (net/close (:fd server)) (catch Throwable _ nil))))))
+
+(defn- unexpected-tls-eof? [error]
+  (and (= javax.net.ssl.SSLException (class error))
+       (str/includes? (str (ex-message error))
+                      "transport closed without TLS close_notify")))
+
+(deftest tls-eof-respects-http-framing-and-close-notify
+  (testing "Content-Length plus close_notify is clean"
+    (let [{:keys [response error]}
+          (tls-response 18450
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                        :tls)]
+      (is (nil? error))
+      (is (= "hello" (some-> response :body core/ba->latin1)))))
+
+  (testing "complete Content-Length does not observe a later raw EOF"
+    (let [{:keys [response error]}
+          (tls-response 18451
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                        :raw)]
+      (is (nil? error))
+      (is (= "hello" (some-> response :body core/ba->latin1)))))
+
+  (testing "truncated Content-Length rejects raw EOF"
+    (let [{:keys [response error]}
+          (tls-response 18452
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe"
+                        :raw)]
+      (is (nil? response))
+      (is (unexpected-tls-eof? error)
+          (str "expected strict TLS EOF, got " (class error) ": "
+               (ex-message error)))))
+
+  (testing "close-delimited TLS requires close_notify"
+    (let [{:keys [response error]}
+          (tls-response 18453 "HTTP/1.1 200 OK\r\n\r\nhello" :raw)]
+      (is (nil? response))
+      (is (unexpected-tls-eof? error)
+          (str "expected strict TLS EOF, got " (class error) ": "
+               (ex-message error)))))
+
+  (testing "truncated chunked response rejects raw EOF"
+    (let [{:keys [response error]}
+          (tls-response 18454
+                        (str "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                             "5\r\nhello\r\n")
+                        :raw)]
+      (is (nil? response))
+      (is (unexpected-tls-eof? error)
+          (str "expected strict TLS EOF, got " (class error) ": "
+               (ex-message error)))))
+
+  (testing "a terminal chunk completes before a later raw EOF"
+    (let [{:keys [response error]}
+          (tls-response 18455
+                        (str "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                             "5\r\nhello\r\n0\r\n\r\n")
+                        :raw)]
+      (is (nil? error))
+      (is (= "hello" (some-> response :body core/ba->latin1))))))
 
 (deftest https-honours-socket-timeout
   ;; connect-stream dropped read-timeout on the https branch, so SO_RCVTIMEO was
