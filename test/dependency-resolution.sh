@@ -11,7 +11,7 @@ if [[ $# -eq 0 ]]; then
 else
   jolt_cmd=("$@")
 fi
-crypto_sha=5effcc89a3258499a79a2a3d69edad9e7800d1bf
+crypto_sha=44da69bad08a2fd7631bd4061e3fb53938dafff6
 canonical_repo_path=/jolt-lang/jolt-crypto
 canonical_cache_path=/https___github.com_jolt-lang_jolt-crypto
 

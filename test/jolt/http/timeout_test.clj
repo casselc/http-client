@@ -6,7 +6,6 @@
   had touched jolt.ffi first."
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
-            [jolt.ffi :as ffi]
             [jolt.process :as p]
             [jolt.http.net :as net]
             [jolt.http.tls :as tls]
@@ -22,19 +21,19 @@
 (def ^:private cert (str (System/getProperty "user.dir") "/test/resources/cert.pem"))
 (def ^:private key  (str (System/getProperty "user.dir") "/test/resources/key.pem"))
 
-(defn- start-stalling-tls []
-  (let [{:keys [fd port]} (srv/open-listener)
+(defn- start-stalling-tls [port]
+  (let [fd (srv/listen-socket port)
         running? (atom true)
         held (atom [])]
     (future
       (loop []
-        (let [transport (srv/accept-transport fd)]
+        (let [raw (srv/accept-raw fd)]
           (when @running?
-            (when transport
+            (when-not (neg? raw)
               ;; Complete the handshake, read the request, then hold the
               ;; connection open forever. Keep a reference so nothing closes it.
-              (future (try (let [st (tls/tls-wrap-server transport cert key)]
-                             ((jolt.host/ref-get st :read) st {})
+              (future (try (let [st (tls/tls-wrap-server raw cert key)]
+                             ((jolt.host/ref-get st :read) st nil)
                              (swap! held conj st))
                            (catch Throwable _ nil))))
             (recur)))))
@@ -45,8 +44,8 @@
   ;; never applied to the socket underneath OpenSSL and recv parked forever. A
   ;; timed deref cannot preempt a thread inside a blocking FFI call, so this was
   ;; unrecoverable from inside the process rather than merely slow.
-  (let [srv (start-stalling-tls)
-        port (:port srv)]
+  (let [port 18443
+        srv (start-stalling-tls port)]
     (try
       (let [t0 (System/currentTimeMillis)
             outcome (try (http/get (str "https://127.0.0.1:" port "/get")
@@ -58,11 +57,11 @@
             "a silent https peer must surface as a read timeout, not park the thread")
         (is (< elapsed 10000)
             (str "should give up near the 1500ms timeout, took " elapsed "ms")))
-      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
 
 (deftest plain-http-still-honours-socket-timeout
-  (let [srv (srv/start-plain)
-        port (:port srv)]
+  (let [port 18080
+        srv (srv/start-plain port)]
     (try
       (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")
                                     {:socket-timeout 5000}))))
@@ -80,13 +79,12 @@
 ;; the defensive load in jolt.http.tls the SSL_* symbols come from a mix of two
 ;; implementations and the first call faults with "invalid memory reference".
 
-(defn- https-in-subprocess [requires url]
+(defn- https-in-subprocess [requires]
   ;; p/process takes the command vector first and the options map second.
   (let [expr (str "(require " requires " '[jolt.http-client :as http])"
-                  "(println :status (:status (http/get " (pr-str url)
-                  " {:insecure? true :socket-timeout 20000})))")
-        jolt-bin (or (System/getenv "JOLT_BIN") "jolt")
-        proc (p/process [jolt-bin "-e" expr] {:out :string :err :string})
+                  "(println :status (:status (http/get \"https://example.com\""
+                  " {:socket-timeout 20000})))")
+        proc (p/process ["jolt" "-e" expr] {:out :string :err :string})
         done (deref proc 120000 ::timeout)]
     (if (= ::timeout done)
       (do (try (p/destroy-tree proc) (catch Throwable _ nil))
@@ -94,17 +92,11 @@
       {:exit (:exit done) :out (str (:out done)) :err (str (:err done))})))
 
 (deftest tls-survives-nrepl-loading-first
-  (let [server (srv/start-tls cert key)
-        port (:port server)]
-    (try
-      (let [{:keys [out err]}
-            (https-in-subprocess "'[jolt.nrepl]"
-                                 (str "https://127.0.0.1:" port "/get"))]
-        (is (str/includes? out ":status 200")
-            (str "https must work with jolt.nrepl loaded before it. out=" out " err=" err))
-        (is (not (str/includes? err "invalid memory reference"))
-            "an SSL_* symbol mix faults rather than failing cleanly"))
-      (finally (srv/stop server)))))
+  (let [{:keys [out err]} (https-in-subprocess "'[jolt.nrepl]")]
+    (is (str/includes? out ":status 200")
+        (str "https must work with jolt.nrepl loaded before it. out=" out " err=" err))
+    (is (not (str/includes? err "invalid memory reference"))
+        "an SSL_* symbol mix faults rather than failing cleanly")))
 
 (deftest openssl-is-pinned-not-libressl
   ;; The concrete symptom to guard: macOS resolving to /usr/lib's LibreSSL. Both
@@ -121,32 +113,32 @@
 ;; one-byte-per-second server ran past two minutes and was still going. That
 ;; leaks a socket and a parked thread per attempt, since nothing unwinds.
 
-(defn- start-trickling-tls []
-  (let [{:keys [fd port]} (srv/open-listener)
+(defn- start-trickling-tls [port]
+  (let [fd (srv/listen-socket port)
         running? (atom true)]
     (future
       (loop []
-        (let [transport (srv/accept-transport fd)]
+        (let [raw (srv/accept-raw fd)]
           (when @running?
-            (when transport
+            (when-not (neg? raw)
               (future
                 (try
-                  (let [st (tls/tls-wrap-server transport cert key)
+                  (let [st (tls/tls-wrap-server raw cert key)
                         write (jolt.host/ref-get st :write)]
-                    ((jolt.host/ref-get st :read) st {})
+                    ((jolt.host/ref-get st :read) st nil)
                     ;; Valid headers promising a body that never finishes...
-                    (write st (byte-array (map int "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")) {})
+                    (write st (byte-array (map int "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")))
                     ;; ...then one byte at a time, forever.
                     (while @running?
-                      (write st (byte-array [(int \x)]) {})
+                      (write st (byte-array [(int \x)]))
                       (Thread/sleep 200)))
                   (catch Throwable _ nil))))
             (recur)))))
-    {:fd fd :port port :running running?}))
+    {:fd fd :running running?}))
 
 (deftest a-trickling-peer-is-bounded-by-the-total-deadline
-  (let [srv (start-trickling-tls)
-        port (:port srv)]
+  (let [port 18445
+        srv (start-trickling-tls port)]
     (try
       (platform/set-max-response-ms! 4000)
       (let [t0 (System/currentTimeMillis)
@@ -162,13 +154,13 @@
       (finally
         (platform/set-max-response-ms! nil)
         (reset! (:running srv) false)
-        (srv/close-listener! (:fd srv))))))
+        (net/close (:fd srv))))))
 
 (deftest no-cap-by-default
   ;; The historical behaviour is unbounded, and a cap applies process-wide, so a
   ;; library that quietly imposed one would change every consumer.
-  (let [srv (srv/start-plain)
-        port (:port srv)]
+  (let [port 18446
+        srv (srv/start-plain port)]
     (try
       (platform/set-max-response-ms! nil)
       (is (= 200 (:status (http/get (str "http://127.0.0.1:" port "/get")))))
@@ -200,8 +192,8 @@
 ;; connect + poll path, which is the part that has to keep the loop going: a
 ;; per-address failure means "try the next one", never "give up on the host".
 (deftest conn-timeout-still-walks-every-address
-  (let [srv (srv/start-plain)
-        port (:port srv)]
+  (let [port 18447
+        srv (srv/start-plain port)]
     (try
       (is (= 200 (:status (http/get (str "http://localhost:" port "/get")
                                     {:conn-timeout 2000 :socket-timeout 5000})))
@@ -217,34 +209,33 @@
 ;; java.net.SocketTimeoutException". The message misdirects debugging to
 ;; SO_RCVTIMEO, which was never set.
 
-(defn- start-resetting-server []
-  (let [{:keys [fd port]} (srv/open-listener)
+(defn- start-resetting-server [port]
+  (let [fd (srv/listen-socket port)
         running? (atom true)]
     (future
       (loop []
-        (let [transport (srv/accept-transport fd)]
+        (let [raw (srv/accept-raw fd)]
           (when @running?
-            (when transport
+            (when-not (neg? raw)
               ;; give the client's bytes time to queue, then close UNREAD: the
               ;; close carries pending inbound data, so the kernel sends RST
-              (future (try (Thread/sleep 100) (net/close transport) (catch Throwable _ nil))))
+              (future (try (Thread/sleep 100) (net/close raw) (catch Throwable _ nil))))
             (recur)))))
-    {:fd fd :port port :running running?}))
+    {:fd fd :running running?}))
 
 (deftest recv-classifies-reset-not-timeout
-  (let [srv (start-resetting-server)
-        port (:port srv)]
+  (let [port 18448
+        srv (start-resetting-server port)]
     (try
-      (let [fd (net/connect "127.0.0.1" port {})]
+      (let [fd (net/connect "127.0.0.1" port nil)]
         (net/send-bytes fd (.getBytes "hello"))
         (let [e (try (net/recv-bytes fd) nil (catch Throwable e e))]
           (is (some? e) "a reset connection must throw, not return")
-          (is (= :connection-reset (:jolt.net/kind (ex-data e)))
-              (str "ECONNRESET keeps its structured transport kind, got "
-                   (pr-str (ex-data e))))
+          (is (str/includes? (str (class e)) "SocketException")
+              (str "ECONNRESET is a socket error, got " (class e)))
           (is (re-find #"[Rr]eset" (or (ex-message e) ""))
               (str "message must name the reset, got " (pr-str (ex-message e))))))
-      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
 
 (deftest tls-handshake-transport-failure-is-ssl-exception
   ;; JVM parity: a transport failure during the TLS handshake surfaces as
@@ -253,8 +244,8 @@
   ;; used to escape tls-connect untouched, so a mid-handshake reset read as a
   ;; read timeout to every caller — including clj-http-lite's
   ;; (is (thrown? SSLException ...)) in self-signed-ssl-get.
-  (let [srv (start-resetting-server)
-        port (:port srv)]
+  (let [port 18449
+        srv (start-resetting-server port)]
     (try
       (let [e (try (tls/tls-connect "127.0.0.1" port false) nil
                    (catch Throwable e e))]
@@ -264,4 +255,64 @@
                  (class e)))
         (is (not (str/includes? (str (class e)) "SocketTimeoutException"))
             "the transport's own exception class must not leak through"))
-      (finally (reset! (:running srv) false) (srv/close-listener! (:fd srv))))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+;; --- a plain peer that accepts and never answers ---------------------------
+;; What a cancelled provider call is parked on. Until reads were sliced, the
+;; only way out was the socket timeout: a thread interrupted while parked in
+;; recv ran the whole SO_RCVTIMEO before it noticed.
+
+(defn- start-stalling-plain [port]
+  (let [fd (srv/listen-socket port)
+        running? (atom true)
+        held (atom [])]
+    (future
+      (loop []
+        (let [raw (srv/accept-raw fd)]
+          (when @running?
+            (when-not (neg? raw) (swap! held conj raw))
+            (recur)))))
+    {:fd fd :port port :running running? :held held}))
+
+(deftest an-interrupt-unblocks-a-parked-read
+  ;; jolt's Thread.interrupt does not reach a thread inside a blocking
+  ;; syscall, so recv-bytes waits in interrupt-slice-ms slices and checks the
+  ;; flag between them. A cancelled request comes back within one slice, as
+  ;; an InterruptedException, with 10 s of socket timeout still to run.
+  (let [port 18081
+        srv (start-stalling-plain port)]
+    (try
+      (let [outcome (promise)
+            t (Thread. (fn []
+                         (let [t0 (System/currentTimeMillis)]
+                           (deliver outcome
+                                    (try (http/get (str "http://127.0.0.1:" port "/get")
+                                                   {:socket-timeout 10000})
+                                         [:returned 0]
+                                         (catch Throwable e
+                                           [(class e) (- (System/currentTimeMillis) t0)]))))))]
+        (.start t)
+        (Thread/sleep 300)
+        (.interrupt t)
+        (let [[cls elapsed] (deref outcome 5000 [:still-parked nil])]
+          (is (= java.lang.InterruptedException cls)
+              (str "the read came back as an interrupt, not a socket timeout: " cls))
+          (is (and elapsed (< elapsed 2000))
+              (str "within a slice of the interrupt, not the 10 s timeout; took " elapsed "ms"))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+(deftest a-sliced-read-still-honours-the-socket-timeout
+  (let [port 18082
+        srv (start-stalling-plain port)]
+    (try
+      (let [t0 (System/currentTimeMillis)
+            outcome (try (http/get (str "http://127.0.0.1:" port "/get")
+                                   {:socket-timeout 800})
+                         :returned
+                         (catch Throwable e (class e)))
+            elapsed (- (System/currentTimeMillis) t0)]
+        (is (= java.net.SocketTimeoutException outcome)
+            "slicing the wait does not change what a silent peer surfaces as")
+        (is (< 700 elapsed 4000)
+            (str "and the bound is still the socket timeout, not a slice; took " elapsed "ms")))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))

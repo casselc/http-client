@@ -1,50 +1,123 @@
 # jolt-lang/http-client
 
-[clj-http-lite](https://github.com/clj-commons/clj-http-lite) running on
-[Jolt](https://github.com/jolt-lang/jolt).
+HTTP for [Jolt](https://github.com/jolt-lang/jolt): the JVM networking APIs that
+Clojure HTTP clients are written against, supplied as Jolt host shims over BSD
+sockets, OpenSSL and libz through `jolt.ffi`. Jolt has no JVM, so none of
+`java.net.URL`, `java.net.http.HttpClient` or `javax.net.ssl` exists until this
+library installs them — the same approach
+[jolt-lang/router](https://github.com/jolt-lang/router) uses for reitit.
 
-clj-http-lite is a small, dependency-light Clojure HTTP client built on the JVM's
-`java.net.HttpURLConnection`. Jolt has no JVM, so this library supplies the host
-APIs clj-http-lite needs as Jolt host shims — the same approach
-[jolt-lang/router](https://github.com/jolt-lang/router) uses for reitit. None of
-it lives in jolt core: requiring this library installs the shims at load.
+Two clients run on it unmodified:
 
 ```clojure
+;; clj-http-lite, re-exported as jolt.http-client
 (require '[jolt.http-client :as http])
-
 (http/get "https://example.com")
-(http/get "https://api.example.com/things" {:query-params {"q" "jolt"} :as :json})
 (http/post "https://example.com/x" {:body "{\"a\":1}" :content-type :json})
-;; also: head, put, delete, and the lower-level request
+
+;; babashka.http-client, straight from Maven
+(require '[jolt.http.platform])            ;; installs the shims
+(require '[babashka.http-client :as bb])
+(bb/get "https://example.com" {:query-params {"q" "jolt"}})
+(bb/post "https://example.com/upload" {:multipart [{:name "f" :content (io/file "x")}]})
+(bb/get "https://example.com" {:async true})
 ```
 
-The functions mirror `clj-http.lite.client` exactly — see its
-[docs](https://github.com/clj-commons/clj-http-lite) for the full request/response
-map.
+An app that only reaches for the classes gets them without any require of ours:
+`deps.edn` declares them under `:jolt/provides` (RFC 0014), so jolt autoloads the
+namespace that installs them. That is also what makes a client compiled from a
+jar work — a dependency namespace resolves its class references before any
+require of ours could run.
 
 ## What it provides
 
-| clj-http-lite uses | Jolt shim |
+| JVM API | Jolt shim |
 | --- | --- |
-| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over the opaque `teensyp.client` API from `jolt-tcp` (`jolt.http.net` / `jolt.http.platform`) |
-| `java.io.ByteArrayInput/OutputStream` | byte-stream tagged-tables wired into `io/copy` / `slurp` |
-| `java.util.zip` (gzip/deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
-| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the opaque jolt-tcp transport (`jolt.http.tls`) |
-| `java.net.http.HttpClient` (JDK 11+ client) | construction, getters, and synchronous/live-settled sends for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by babashka.http-client and cognitect aws-api. `sendAsync` returns an already-settled future, not a general `CompletableFuture`. |
+| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 over BSD sockets via `jolt.ffi` (`jolt.http.core` / `jolt.http.platform`) |
+| `java.net.http.HttpClient` (JDK 11+) | `jolt.http.jdk` — client/request/response builders, `BodyPublishers`/`BodyHandlers`, `HttpHeaders`, over the same transport |
+| `java.util.concurrent.CompletableFuture` | a real callback-driven future: `sendAsync` runs on jolt's future pool, `thenApply`/`exceptionally`/`thenCompose` chain off it, `@` derefs |
+| `java.net.http.WebSocket` | `jolt.http.websocket` — RFC 6455 client (handshake, frame codec, listener callbacks) |
+| `java.net.ProxySelector`, `Proxy`, `CookieManager`, `Authenticator` | real routing, not just constructors — see below |
+| `javax.net.ssl` (`SSLContext`, `SSLParameters`, trust managers, `KeyStore`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`), including PKCS#12 key and trust stores |
+| `java.io` byte streams, `java.io.SequenceInputStream` | jolt's own streams where it has them, shims where it does not |
+| `java.util.zip` (gzip/deflate/raw deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
 
-`jolt-tcp` and its transitive `jolt-net` dependency own platform socket
-declarations and never expose a descriptor here. This project declares libz;
-`jolt-crypto` declares OpenSSL. Jolt reconciles and loads those native libraries
-before the corresponding namespaces are required.
+The native libraries (libc sockets, libz, OpenSSL) are declared in `deps.edn`
+under `:jolt/native`; jolt loads them before the namespaces are required.
 
-Positive connect/read timeouts retain their millisecond budgets.
-`HttpURLConnection`'s unset/zero connect timeout remains unbounded, and
-`HttpRequest.timeout` is one absolute monotonic deadline spanning connect,
-TLS handshake, request write, and every response read. One current platform
-limitation remains: `jolt.net` resolves names through synchronous
-`getaddrinfo`. A result returned after the connect deadline is rejected, but an
-in-flight resolver call cannot yet be preempted, so wall-clock connect time can
-overrun the configured budget while DNS is blocked.
+This fork is an append-only convergence of the request-aspect lineage and
+`jolt-lang/http-client` v0.0.10. It packages exactly one provider-neutral
+`:http-client.core/request` aspect for `clj-http.lite.core/request`; the
+transport, timeout and cancellation behavior otherwise comes from v0.0.10.
+In particular, a thread interrupted during a blocked response read returns
+within the documented 250 ms poll slice instead of waiting for the complete
+socket timeout. The minimum supported runtime remains Jolt 0.8.1.
+
+## Client options
+
+Everything `babashka.http-client`'s `client` accepts is honoured at send time,
+not merely stored:
+
+- **`:proxy`** — a map, or a function of the request URI, or a `ProxySelector`.
+  Plain http goes through the proxy as an absolute-form request line; https
+  tunnels with `CONNECT` and runs the TLS handshake inside the tunnel, so the
+  proxy never sees plaintext.
+- **`:cookie-handler`** — `:accept-all` / `:accept-none` / `:original-server`
+  (RFC 6265 domain matching). Cookies are stored from `Set-Cookie` and sent back
+  on later requests through the same client.
+- **`:ssl-context`** — `{:insecure true}` to accept any certificate, or
+  `:key-store` / `:trust-store` PKCS#12 files with their passwords. A trust store
+  replaces the platform CA set, the way a `TrustManagerFactory` over a truststore
+  does on the JVM.
+- **`:authenticator`** — `{:user … :pass …}` answers a `401` by retrying once with
+  Basic credentials.
+- **`:follow-redirects`** — `:never` / `:normal` / `:always`, with `:normal`
+  refusing an https→http downgrade like `java.net.http`.
+- **`:connect-timeout`**, and per-request `:timeout`, which bounds the whole
+  exchange.
+
+Not emulated: HTTP/2 (`:version :http2` is accepted and the exchange is
+HTTP/1.1), request `:priority`, and a caller-supplied `:executor` — the async
+send runs on jolt's own future pool. Each is recorded on the client and read
+back, so a caller that sets and inspects one sees what it set. WebSocket
+negotiates no extensions, so no `permessage-deflate`.
+
+Response bodies are read in full before the response is returned, so `:as
+:stream` hands back a stream over the complete body rather than a live one. It
+behaves like the JDK's for anything finite — `slurp`, `io/copy` and `io/reader`
+all work on it — but a response that never ends, such as an SSE feed, never
+returns. Restricted request headers behave as `java.net.http` does: setting
+`content-length`, `connection`, `host`, `upgrade` or `expect` on a request is an
+`IllegalArgumentException`, because the client owns them.
+
+## Connections
+
+Connections are pooled and reused per origin. HTTP/1.1 is persistent by default,
+so a request carries no `Connection: close` and the socket goes back to the pool
+when the response framed itself with `Content-Length` or chunked encoding and the
+server did not ask to close. Reuse is what makes a second request to the same
+host cost a round trip instead of a connect plus, for https, a full TLS
+handshake: ten sequential `https://example.com` GETs measured 308 ms pooled
+against 1184 ms without.
+
+A peer can retire a pooled connection between requests and nothing can rule that
+out in advance. Two things cover it: a socket the peer has already closed is
+detected and dropped before it is used, and a reused connection that answers with
+no bytes at all is retried once on a fresh one — a peer that never sent a byte
+never acted on the request, so even a `POST` is safe to retry there.
+
+The knobs live in `jolt.http.core`, and apply process-wide:
+
+```clojure
+(reset! jolt.http.core/pool-enabled? false)   ;; one connection per request
+(reset! jolt.http.core/pool-idle-ms 5000)     ;; how long an idle connection is kept
+(reset! jolt.http.core/pool-max-per-key 8)    ;; idle connections kept per origin
+(jolt.http.core/pool-clear!)                  ;; close and forget everything pooled
+```
+
+TLS contexts are shared too: an `SSL_CTX` is cached per client configuration
+rather than built per request, which matters because a verifying one loads the
+platform CA bundle (5.7 ms against 0.09 ms for `:insecure true`).
 
 ## Timeouts
 
@@ -55,46 +128,71 @@ you pass them.
 (http/get "https://example.com" {:conn-timeout 2000 :socket-timeout 10000})
 ```
 
-`:conn-timeout` becomes one monotonic connect budget across name resolution and
-all address candidates. `:socket-timeout` bounds each individual read. The
-`HttpRequest.timeout` value used by the modern client shim is a separate absolute
-deadline spanning connect, TLS handshake, request write, and response reads.
-For URLConnection consumers that need the same total bound, call
-`jolt.http.platform/set-max-response-ms!`; pass `nil` to restore the default
-unbounded behavior. That compatibility setting is process-wide.
+`:conn-timeout` bounds each connect attempt, the way `java.net.Socket`'s does —
+a name resolving to a dead address and a live one still connects, and the dead
+one costs at most the timeout instead of the kernel's SYN retry window (~75s on
+macOS, ~130s on Linux). `:socket-timeout` bounds each individual read.
+
+Neither bounds a peer that keeps trickling bytes: every read beats the read
+timeout, so the response never ends. `(jolt.http.platform/set-max-response-ms!
+ms)` caps the total wall-clock time of a response body across all reads. It
+applies process-wide, and is nil (uncapped) by default. On the
+`babashka.http-client` side, a per-request `:timeout` does the same thing for one
+request.
 
 ## Requirements
 
-- Jolt 0.8.0 or newer. This library uses the value-first `jolt.ffi/write`
-  signature introduced in 0.8.0. The floor is declared as `:jolt/min-version`
-  so supported runtimes reject an incompatible dependency graph before a native
-  buffer can be written with the old offset-first interpretation. It also
-  relies on the scoped native-allocation, host byte-stream, and native transport
-  APIs supplied by the current runtime and pinned dependencies. `jolt-crypto`
-  resolves once from its canonical `jolt-lang` repository at a full reviewed
-  revision; `test/dependency-resolution.sh` fails if the selected graph drifts
-  to a fork, another revision, or two repository identities.
+- jolt 0.8.1 or newer, declared as `:jolt/min-version`. 0.8.1 is where
+  `java.util.concurrent`'s executor interfaces entered jolt's class graph;
+  without them `babashka.http-client`'s `->Executor` builds a pool that answers
+  false to `(instance? ThreadPoolExecutor …)`.
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
+
+## Namespaces
+
+| | |
+| --- | --- |
+| `jolt.http-client` | the public clj-http-lite API |
+| `jolt.http.core` | the HTTP/1.1 engine: transport, URL parser, request/response codec — shared, so the two client surfaces cannot drift |
+| `jolt.http.net` | BSD sockets over `jolt.ffi` |
+| `jolt.http.tls` | OpenSSL, including PKCS#12 stores and `CONNECT`-tunnel wrapping |
+| `jolt.http.zlib` | libz |
+| `jolt.http.platform` | `java.net.URL` / `HttpURLConnection` / byte streams / `java.util.zip`; requiring it installs everything |
+| `jolt.http.jdk` | `java.net.http` and the `java.net` / `javax.net.ssl` classes around it |
+| `jolt.http.websocket` | RFC 6455 |
 
 ## Tests
 
-`jolt -M:test` runs clj-http-lite's own `client`, `links` and `integration`
-suites under Jolt. The suites are vendored under `test/clj_http/lite`; their
-`server-process` fixture is replaced with in-process plaintext + TLS servers
-(`jolt.http.test-server`, with a test-only listener feeding the same opaque byte
-transport + OpenSSL engine) in place of the suite's Jetty subprocess — no
-external checkout needed.
+Six suites, each its own process — they bind their own ports and stand up their
+own servers. CI runs all of them except `:timeouttest`.
 
 ```
-jolt -M:test
-```
-
-The main suite includes deterministic transport/deadline and TLS error-ordering
-tests in addition to clj-http-lite's integration suite. Additional suites are:
-
-```
-jolt -M:timeouttest   # timeout/deadline regressions
-jolt -M:bhctest       # babashka.http-client compatibility
+jolt -M:test          # the HTTP/1.1 engine itself (jolt.http.core-test: URL
+                      # parsing, RFC 3986 reference resolution, request
+                      # serialisation, response framing, connection reuse), plus
+                      # clj-http-lite's own client, links and integration suites,
+                      # vendored under test/clj_http/lite, with in-process
+                      # plaintext + TLS servers in place of the Jetty subprocess
+jolt -M:bhctest       # babashka.http-client, unmodified from Maven, over the
+                      # java.net.http shim — request/response surface,
+                      # interceptors, :async, multipart, proxy, cookies, auth
+jolt -M:wstest        # RFC 6455: the frame codec both directions, plus
+                      # babashka.http-client.websocket against an echo server
+jolt -M:tlstest       # ssl-context, PKCS#12 key/trust stores, CONNECT
+                      # tunnelling, wss — the server is self-signed, so the
+                      # default client must refuse it
 jolt -M:zlibtest      # zlib round-trip, no sockets
-bash test/dependency-resolution.sh jolt # canonical selected dependency graph
+jolt -M:cancellationtest # hermetic blocked-read interruption regression
+jolt -M:timeouttest   # timeout/deadline regressions; stalls connections on
+                      # purpose. One case loads jolt.nrepl in a subprocess and
+                      # fetches https://example.com, so it needs network egress.
 ```
+
+Values the suites assert on — the bytes `java.net.http` puts on the wire, what
+`java.net.URL`/`URI` getters return, what `java.net.URI/resolve` makes of a
+relative `Location`, which request headers the JDK refuses, and when a cookie is
+withheld — were measured against a real JDK rather than recalled.
+
+The `:bhctest` multipart case parses the body the client built with
+[jolt-lang/multipart](https://github.com/jolt-lang/multipart), so it asserts on
+the parts rather than on a byte blob.

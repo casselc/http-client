@@ -1,12 +1,78 @@
-{:paths ["src" "resources"]
+{;; jolt.ffi/write takes the value BEFORE the offset as of jolt 0.8.0, and the
+ ;; two spellings are both integers — an older runtime writes to the wrong
+ ;; place rather than failing. Declare the floor so it refuses instead.
+ ;;
+ ;; 0.8.1 rather than 0.8.0 because that is where java.util.concurrent's executor
+ ;; and future interfaces entered jolt's class graph: on 0.8.0 the pool
+ ;; babashka.http-client's `->Executor` builds answers false to
+ ;; (instance? java.util.concurrent.ThreadPoolExecutor …), so a caller that
+ ;; type-checks its own :executor rejects a working one.
+ :jolt/min-version "0.8.1"
 
- :jolt/min-version "0.8.0"
+ :paths ["src" "resources"]
+
+ ;; The JDK classes this library implements (RFC 0014). Declaring them is not
+ ;; documentation: jolt resolves the class references in a DEPENDENCY namespace
+ ;; against this table before that namespace compiles, which is earlier than any
+ ;; require of ours can run. Without the declaration, babashka.http-client's
+ ;; `(proxy [java.net.ProxySelector] [] …)` — compiled from ~/.m2, not from
+ ;; :paths — failed with "No dependency provides java.net.ProxySelector" however
+ ;; early the shims were installed. It is also what lets an app reach for
+ ;; java.net.http.HttpClient (cognitect aws-api does) with no install require at
+ ;; all: jolt autoloads the namespace named here.
+ ;;
+ ;; Fully-qualified only; jolt derives the simple spelling. Classes jolt models
+ ;; itself (java.net.URL and java.net.URI, java.net.InetSocketAddress,
+ ;; java.nio.file.Files, java.security.SecureRandom) are deliberately absent —
+ ;; claiming one the runtime already provides is an error. jolt.http.platform
+ ;; still REPLACES java.net.URL's constructor with a full parser; replacing is
+ ;; not claiming, and only the claim is checked.
+ :jolt/provides
+ {jolt.http.platform ["java.net.HttpURLConnection"
+                      "javax.net.ssl.HttpsURLConnection"
+                      "java.util.zip.GZIPInputStream"
+                      "java.util.zip.GZIPOutputStream"
+                      "java.util.zip.InflaterInputStream"
+                      "java.util.zip.DeflaterInputStream"
+                      "java.util.zip.Inflater"]
+  jolt.http.jdk ["java.net.http.HttpClient"
+                 "java.net.http.HttpClient$Redirect"
+                 "java.net.http.HttpClient$Version"
+                 "java.net.http.HttpRequest"
+                 "java.net.http.HttpRequest$BodyPublisher"
+                 "java.net.http.HttpRequest$BodyPublishers"
+                 "java.net.http.HttpResponse"
+                 "java.net.http.HttpResponse$BodyHandlers"
+                 "java.net.http.HttpHeaders"
+                 "java.util.concurrent.CompletableFuture"
+                 "java.io.SequenceInputStream"
+                 "java.net.Proxy"
+                 "java.net.Proxy$Type"
+                 "java.net.ProxySelector"
+                 "java.net.CookieHandler"
+                 "java.net.CookieManager"
+                 "java.net.CookiePolicy"
+                 "java.net.CookieStore"
+                 "java.net.HttpCookie"
+                 "java.net.Authenticator"
+                 "java.net.PasswordAuthentication"
+                 "java.security.KeyStore"
+                 "javax.net.ssl.SSLContext"
+                 "javax.net.ssl.SSLParameters"
+                 "javax.net.ssl.TrustManager"
+                 "javax.net.ssl.X509TrustManager"
+                 "javax.net.ssl.X509ExtendedTrustManager"
+                 "javax.net.ssl.KeyManager"
+                 "javax.net.ssl.KeyManagerFactory"
+                 "javax.net.ssl.TrustManagerFactory"]
+  jolt.http.websocket ["java.net.http.WebSocket"
+                       "java.net.http.WebSocket$Builder"
+                       "java.net.http.WebSocket$Listener"]}
 
  ;; clj-http-lite straight from its git repo. Jolt ignores the org.clojure/clojure
  ;; dependency it declares; this library supplies the JVM host APIs clj-http-lite
  ;; needs (HttpURLConnection / URL / java.util.zip / javax.net.ssl) as Jolt host
- ;; shims, plus TCP through jolt-tcp, TLS through OpenSSL memory BIOs, and gzip
- ;; through libz.
+ ;; shims, plus TLS (OpenSSL) and gzip (libz) through jolt.ffi.
  ;; clj-http-lite straight from git; jolt-lang/jolt-crypto carries the OpenSSL
  ;; (libssl/libcrypto) declarations + the java.security.SecureRandom shim TLS
  ;; needs — so this library and the ring adapter don't each redeclare them
@@ -14,15 +80,14 @@
  :deps {org.clj-commons/clj-http-lite
         {:git/url "https://github.com/clj-commons/clj-http-lite"
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
-        io.github.casselc/jolt-tcp
-        {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "85f67fb76c4c6d392f5dd51821e458d446ebae01"}
         jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "5effcc89a3258499a79a2a3d69edad9e7800d1bf"}}
+                               :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
 
- ;; jolt-tcp owns the transitive platform socket declarations. libssl/libcrypto
- ;; come from jolt-crypto; this project declares only libz directly.
- :jolt/native [{:name "z"
+ ;; libc (BSD sockets, the running process's symbols) and libz (gzip); libssl/
+ ;; libcrypto come from jolt-crypto, loaded before these namespaces so the
+ ;; foreign-fn bindings in jolt.http.tls resolve.
+ :jolt/native [{:name "libc (POSIX sockets)" :process true}
+               {:name "z"
                 :darwin ["libz.dylib" "/usr/lib/libz.dylib"]
                 :linux  ["libz.so.1" "libz.so"]}]
 
@@ -31,18 +96,41 @@
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "jolt.http.test-runner"]}
            ;; https read-timeout + OpenSSL symbol-pinning regressions. Separate
-           ;; process: they stall a connection on purpose and stand up their own
-           ;; servers, which the main suite's serial accept loop doesn't tolerate.
+           ;; process: they stall connections on purpose and stand up their own
+           ;; servers on their own ports.
            :timeouttest {:extra-paths ["test"]
                          :main-opts ["-m" "jolt.http.timeout-runner"]}
+           ;; Hermetic cancellation regression: unlike :timeouttest this does
+           ;; not make the one intentional public-network request.
+           :cancellationtest {:extra-paths ["test"]
+                              :main-opts ["-m" "jolt.http.cancellation-runner"]}
            ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
            :zlibtest {:extra-paths ["test"]
                       :main-opts ["-m" "jolt.http.zlib-test"]}
-           ;; babashka.http-client compat: it runs on jolt over jolt.http.platform's
-           ;; java.net.http shim. Plaintext in-process server, so no TLS/crypto.
+           ;; babashka.http-client, unmodified from Maven, over the java.net.http
+           ;; shim. jolt-lang/multipart parses the multipart bodies the client
+           ;; builds, so the test asserts on the parts rather than on a byte blob.
            :bhctest {:extra-paths ["test"]
-                     :extra-deps {org.babashka/http-client {:mvn/version "0.4.23"}}
-                     :main-opts ["-m" "jolt.http.babashka-test"]}}
+                     :extra-deps {org.babashka/http-client {:mvn/version "0.4.24"}
+                                  jolt-lang/multipart
+                                  {:git/url "https://github.com/jolt-lang/multipart"
+                                   :git/sha "be6079d3ae9d91bb1e31728c20a69e2a99d5e4fe"}}
+                     :main-opts ["-m" "jolt.http.babashka-test"]}
+           ;; RFC 6455 client + frame codec, driven through
+           ;; babashka.http-client.websocket against an in-process echo server.
+           :wstest {:extra-paths ["test"]
+                    :extra-deps {org.babashka/http-client {:mvn/version "0.4.24"}}
+                    :main-opts ["-m" "jolt.http.websocket-test"]}
+           ;; TLS through the java.net.http path: ssl-context, PKCS#12 stores,
+           ;; CONNECT tunnelling, wss. Its own process — it stands up TLS servers.
+           :tlstest {:extra-paths ["test"]
+                     :extra-deps {org.babashka/http-client {:mvn/version "0.4.24"}}
+                     :main-opts ["-m" "jolt.http.tls-test"]}}
 
  :tasks {test "jolt -M:test"
+         bhctest "jolt -M:bhctest"
+         wstest "jolt -M:wstest"
+         tlstest "jolt -M:tlstest"
+         zlibtest "jolt -M:zlibtest"
+         cancellationtest "jolt -M:cancellationtest"
          timeouttest "jolt -M:timeouttest"}}

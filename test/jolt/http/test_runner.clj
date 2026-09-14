@@ -10,10 +10,9 @@
             [clojure.test :as t]
             [jolt.http.aspect-manifest-test]
             [jolt.http.stream-shim-test]
+            [jolt.http.core-test]
             [clj-http.lite.links-test]
             [clj-http.lite.client-test]
-            [jolt.http.net-test]
-            [jolt.http.tls-test]
             [clj-http.lite.integration-test]))
 
 (defn -main [& _]
