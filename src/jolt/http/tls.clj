@@ -123,6 +123,12 @@
   [msg]
   (jolt.host/throwable "javax.net.ssl.SSLException" (str msg)))
 
+(def unexpected-transport-eof-message
+  "Stable marker for a raw transport EOF that arrived without TLS close_notify.
+  The HTTP pool uses this exact message to distinguish a retired idle TLS socket
+  from unrelated SSL failures when no response byte has arrived."
+  "transport closed without TLS close_notify")
+
 ;; A NUL-terminated C-string pointer; the caller frees it.
 (defn- cstr [s] (ffi/string->ptr (str s)))
 
@@ -235,8 +241,7 @@
                         (= err WANT-READ)
                         (if (feed-in self)
                           (recur)
-                          (throw (ssl-ex
-                                  "transport closed without TLS close_notify")))
+                          (throw (ssl-ex unexpected-transport-eof-message)))
 
                         (= err WANT-WRITE) (do (flush-out self) (recur))
                       :else (throw (ssl-ex

@@ -598,11 +598,16 @@
 
   Which of these a retired keep-alive socket produces is not something a client
   gets to choose: Linux sends RST rather than FIN when it closes a socket with
-  unread data, so the same dead connection surfaces as SocketException there and
-  as a clean EOF elsewhere."
+  unread data, so the same dead connection surfaces as SocketException there,
+  as a clean EOF elsewhere, and as the strict unexpected-transport-EOF marker
+  when the pooled stream is TLS. Other SSLException values are real TLS failures
+  and are never classified as a stale socket."
   [t]
-  (contains? #{"class java.io.EOFException" "class java.net.SocketException"}
-             (str (class t))))
+  (let [class-name (str (class t))]
+    (or (contains? #{"class java.io.EOFException" "class java.net.SocketException"}
+                   class-name)
+        (and (= "class javax.net.ssl.SSLException" class-name)
+             (= tls/unexpected-transport-eof-message (ex-message t))))))
 
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it

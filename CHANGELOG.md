@@ -13,7 +13,10 @@
   real request entry exactly once and rejects zero/duplicate matches. TLS keeps
   HTTP framing completion independent from transport shutdown while accepting
   only `close_notify` as clean TLS EOF, so framed-complete raw closes succeed
-  without an extra read and truncated or close-delimited raw closes fail.
+  without an extra read and truncated or close-delimited raw closes fail. A raw
+  close on a reused TLS connection before any response byte is classified
+  narrowly as a stale pooled socket and retried fresh; unrelated TLS failures
+  and every mid-response truncation still surface to the caller.
 
 - Resolve `jolt-crypto` from its canonical `jolt-lang` repository at the
   reviewed Jolt 0.8 provider/value-first revision, with a fail-closed selected

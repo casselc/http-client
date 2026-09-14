@@ -299,16 +299,26 @@
           (is (= 3 (:requests @(:stats s))))
           (finally (core/pool-clear!) (srv/stop s)))))))
 
-(defn- typed [cls] (try (core/throw-typed cls "x") (catch Throwable t t)))
+(defn- typed
+  ([cls] (typed cls "x"))
+  ([cls message]
+   (try (core/throw-typed cls message) (catch Throwable t t))))
 
 (deftest connection-gone-tells-a-dead-socket-from-a-slow-one
   (testing "a peer that went away, however the platform reports it"
     (is (true? (core/connection-gone? (typed "java.io.EOFException"))))
-    (is (true? (core/connection-gone? (typed "java.net.SocketException")))))
+    (is (true? (core/connection-gone? (typed "java.net.SocketException"))))
+    (is (true? (core/connection-gone?
+                (typed "javax.net.ssl.SSLException"
+                       "transport closed without TLS close_notify")))))
   (testing "a timeout says the peer is slow, not gone, and is never retried"
     (is (false? (core/connection-gone? (typed "java.net.SocketTimeoutException")))))
   (testing "a malformed response is the peer's answer, not its absence"
-    (is (false? (core/connection-gone? (typed "java.io.IOException"))))))
+    (is (false? (core/connection-gone? (typed "java.io.IOException")))))
+  (testing "unrelated TLS failures are never classified as a stale socket"
+    (is (false? (core/connection-gone?
+                 (typed "javax.net.ssl.SSLException"
+                        "certificate verification failed"))))))
 
 (defn- truncating-handler
   "Answers the first request on a connection; on the next one sends headers and

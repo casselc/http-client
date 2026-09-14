@@ -87,6 +87,59 @@
        (str/includes? (str (ex-message error))
                       "transport closed without TLS close_notify")))
 
+(defn- start-stale-pooled-tls [port]
+  (let [fd (srv/listen-socket port)
+        requests (atom 0)
+        done (promise)
+        response "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"]
+    (future
+      (try
+        ;; The first connection answers once and remains live until the client
+        ;; reuses it. Only after the second request reaches the wire do we raw
+        ;; close it, forcing the exact idle-check/read race under test.
+        (let [raw (srv/accept-raw fd)
+              stream (tls/tls-wrap-server raw cert key)
+              write (jolt.host/ref-get stream :write)]
+          (read-tls-request-head! stream)
+          (swap! requests inc)
+          (write stream (core/latin1->ba response))
+          (read-tls-request-head! stream)
+          (swap! requests inc)
+          (net/close raw))
+        ;; The retry must open a fresh TLS connection and send the request once.
+        (let [raw (srv/accept-raw fd)
+              stream (tls/tls-wrap-server raw cert key)
+              write (jolt.host/ref-get stream :write)]
+          (read-tls-request-head! stream)
+          (swap! requests inc)
+          (write stream (core/latin1->ba response))
+          ((jolt.host/ref-get stream :close) stream))
+        (deliver done true)
+        (catch Throwable error
+          (deliver done error))
+        (finally
+          (try (net/close fd) (catch Throwable _ nil)))))
+    {:fd fd :done done :requests requests}))
+
+(deftest stale-pooled-tls-transport-eof-retries-before-response
+  (let [port 18456
+        server (start-stale-pooled-tls port)
+        url (str "https://127.0.0.1:" port "/")]
+    (core/pool-clear!)
+    (try
+      (is (= "ok" (some-> (http/get url {:insecure? true :socket-timeout 3000})
+                            :body core/ba->latin1)))
+      (is (= 1 (core/pool-count)) "the first TLS connection is pooled")
+      (is (= "ok" (some-> (http/get url {:insecure? true :socket-timeout 3000})
+                            :body core/ba->latin1))
+          "raw EOF before response is retried on a fresh TLS connection")
+      (is (= true (deref (:done server) 3000 ::server-timeout)))
+      (is (= 3 @(:requests server))
+          "two caller requests produce the raced attempt plus one fresh retry")
+      (finally
+        (core/pool-clear!)
+        (try (net/close (:fd server)) (catch Throwable _ nil))))))
+
 (deftest tls-eof-respects-http-framing-and-close-notify
   (testing "Content-Length plus close_notify is clean"
     (let [{:keys [response error]}
