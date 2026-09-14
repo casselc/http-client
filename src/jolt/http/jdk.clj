@@ -556,9 +556,7 @@
           (core/set-stream-timeout! pooled read-timeout)
           (exchange-once pooled (boolean (and proxy (not https?))) key req received)
           (catch Throwable t
-            (if (and (core/idempotent-method? method)
-                     (not @received)
-                     (core/connection-gone? t))
+            (if (core/retryable-stale-failure? method @received t)
               (fresh!)
               (throw t)))))
       (fresh!))))

@@ -326,6 +326,15 @@
   (doseq [method ["CONNECT" "PATCH" "POST" nil]]
     (is (not (core/idempotent-method? method)) (str method " is not replayable"))))
 
+(deftest interruption-is-never-a-replayable-transport-failure
+  (let [gone (typed "java.net.SocketException")
+        interrupted (typed "java.lang.InterruptedException")]
+    (is (core/retryable-stale-failure? "GET" false gone))
+    (is (not (core/retryable-stale-failure? "POST" false gone)))
+    (is (not (core/retryable-stale-failure? "GET" true gone)))
+    (is (not (core/retryable-stale-failure? "GET" false interrupted))
+        "a partial interrupted write may already have reached the peer")))
+
 (defn- truncating-handler
   "Answers the first request on a connection; on the next one sends headers and
   then hangs up mid-body."

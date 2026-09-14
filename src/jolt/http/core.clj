@@ -617,6 +617,18 @@
   (contains? #{"DELETE" "GET" "HEAD" "OPTIONS" "PUT" "TRACE"}
              (str/upper-case (str method))))
 
+(defn retryable-stale-failure?
+  "Whether a failed pooled exchange may be repeated on a fresh connection.
+
+  All three facts are required: the method is idempotent, no response byte was
+  observed, and the throwable means the old transport disappeared. In
+  particular InterruptedException is never a dead-connection signal: a write
+  may already have put an arbitrary request prefix on the wire."
+  [method received? throwable]
+  (and (idempotent-method? method)
+       (not received?)
+       (connection-gone? throwable)))
+
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it
   is framed. `deadline` is an absolute System/currentTimeMillis bound on the

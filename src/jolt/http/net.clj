@@ -85,10 +85,61 @@
 (def ^:private po-pollin 1)
 (def ^:private po-pollout 4)
 
+;; errno values differ per platform: EINTR is 4 on both; EAGAIN 35/11,
+;; ECONNRESET 54/104, EPIPE 32/32 (macOS/Linux).
+(def ^:private eintr 4)
+(def ^:private eagain (if macos? 35 11))
+(def ^:private econnreset (if macos? 54 104))
+(def ^:private epipe 32)
+
+(def interrupt-slice-ms
+  "The longest one socket-readiness wait runs before checking interruption.
+
+  Jolt's Thread.interrupt sets the flag but cannot signal a thread parked in a
+  native syscall. Connect, read, and write waits therefore use this common
+  slice rather than handing an entire timeout (or an unbounded wait) to poll."
+  250)
+
 (defn- conn-ex [class msg]
   ;; a typed throwable so callers get the right (class e)/instance? AND a working
   ;; .getMessage/ex-message (the cognitect aws backend reads .getMessage).
   (throw (jolt.host/throwable class (str msg))))
+
+(defn- check-interrupted! [operation]
+  ;; Match an interrupted sleep: Thread/interrupted observes and clears the flag,
+  ;; then the typed InterruptedException is the cancellation result callers see.
+  (when (Thread/interrupted)
+    (conn-ex "java.lang.InterruptedException" (str operation " interrupted"))))
+
+(defn- await-ready!
+  "Wait for EVENTS on fd in interruptible slices. DEADLINE is an absolute wall
+  clock millisecond or nil. Returns nil when ready and :timeout at the deadline.
+  poll EINTR is owed again, but the interrupt flag is checked before that retry."
+  [fd events deadline operation]
+  (let [pf (ffi/alloc 8)]
+    (try
+      ;; struct pollfd { int fd; short events; short revents; } — 8 bytes LP64.
+      (dotimes [i 8] (ffi/write pf :uint8 0 i))
+      (ffi/write pf :int fd 0)
+      (ffi/write pf :uint16 events 4)
+      (loop []
+        ;; Interruption wins when it races the deadline, consistently with the
+        ;; existing read path and java.lang.InterruptedException conventions.
+        (check-interrupted! operation)
+        (let [now (System/currentTimeMillis)]
+          (if (and deadline (>= now deadline))
+            :timeout
+            (let [slice (if deadline
+                          (min interrupt-slice-ms (max 0 (- deadline now)))
+                          interrupt-slice-ms)
+                  pr (c-poll pf 1 (int slice))]
+              (cond
+                (pos? pr) nil
+                (and deadline (>= (System/currentTimeMillis) deadline)) :timeout
+                (zero? pr) (recur)
+                (= (poller/errno) eintr) (recur)
+                :else (conn-ex "java.io.IOException" "poll failed"))))))
+      (finally (ffi/free pf)))))
 
 ;; A timed connect needs the socket non-blocking: connect() then returns -1
 ;; immediately (EINPROGRESS) and poll() waits on it, with SO_ERROR telling us
@@ -129,42 +180,32 @@
 ;; -1 (EINPROGRESS) instead of blocking; poll then waits on it and SO_ERROR
 ;; reports the outcome.
 (defn- timed-connect [fd addr addrlen timeout-ms]
-  (if (zero? (c-connect fd addr addrlen))
-    0
-    (let [pf (ffi/alloc 8)]
-      (try
-        ;; struct pollfd { int fd; short events; short revents; } — 8 bytes LP64.
-        ;; events is the 16-bit field at offset 4 and revents the one at 6, left
-        ;; zeroed for poll() to fill in. Writing events as a 16-bit value rather
-        ;; than packing both halves into one :int keeps this right on a
-        ;; big-endian host too.
-        (dotimes [i 8] (ffi/write pf :uint8 0 i))
-        (ffi/write pf :int fd 0)
-        (ffi/write pf :uint16 po-pollout 4)
-        (let [pr (c-poll pf 1 (int timeout-ms))]
-          (cond
-            ;; writable — the connect either completed or failed; SO_ERROR tells.
-            (pos? pr) (socket-error fd)
-            (zero? pr) :timeout
-            :else (conn-ex "java.io.IOException" "poll failed")))
-        (finally (ffi/free pf))))))
+  (let [deadline (when (and timeout-ms (pos? timeout-ms))
+                   (+ (System/currentTimeMillis) timeout-ms))]
+    (check-interrupted! "connect")
+    (if (zero? (c-connect fd addr addrlen))
+      0
+      (if (= :timeout (await-ready! fd po-pollout deadline "connect"))
+        :timeout
+        ;; writable — the connect either completed or failed; SO_ERROR tells.
+        (socket-error fd)))))
 
 (defn- attempt-connect [fd addr addrlen timeout-ms]
-  (if (and timeout-ms (pos? timeout-ms))
-    (do (set-nonblock! fd true)
-        (let [rc (timed-connect fd addr addrlen timeout-ms)]
-          ;; Restore blocking only for the fd we are handing back: recv/send and
-          ;; SO_RCVTIMEO downstream all assume a blocking socket. On any failure
-          ;; the caller closes it, so there is nothing to restore, and skipping
-          ;; the restore keeps a failing fcntl from masking the real error.
-          (when (= 0 rc) (set-nonblock! fd false))
-          rc))
-    (c-connect fd addr addrlen)))
+  ;; Every connect is temporarily non-blocking. A nil/nonpositive timeout keeps
+  ;; the historical unbounded deadline, but is still interruptible between poll
+  ;; slices rather than inheriting the kernel's multi-minute SYN retry wait.
+  (set-nonblock! fd true)
+  (let [rc (timed-connect fd addr addrlen timeout-ms)]
+    ;; Restore blocking only for the fd we are handing back: the downstream read
+    ;; timeout is still SO_RCVTIMEO-based. Failed/interrupted fds are closed by
+    ;; connect's address owner, and no restore may mask the primary failure.
+    (when (= 0 rc) (set-nonblock! fd false))
+    rc))
 
 (defn connect
   "Resolve host:port and open a connected TCP socket; return its fd. `timeout-ms`,
-  when positive, bounds each connect attempt with a non-blocking connect + poll —
-  without it, a blocked connect is bounded only by the kernel's SYN retry limit.
+  when positive, bounds each connect attempt. Every attempt uses non-blocking
+  connect + sliced poll, so one without a deadline is still interruptible.
   The bound is per address, as java.net.Socket's is: a host resolving to both a
   dead and a live address still connects. Throws a java.net.UnknownHostException
   / ConnectException-tagged throwable on failure."
@@ -253,28 +294,6 @@
 
 (def ^:private bufsize 65536)
 
-;; errno values differ per platform: EINTR is 4 on both; EAGAIN 35/11,
-;; ECONNRESET 54/104, EPIPE 32/32 (macOS/Linux).
-(def ^:private eintr 4)
-(def ^:private eagain (if macos? 35 11))
-(def ^:private econnreset (if macos? 54 104))
-(def ^:private epipe 32)
-
-(def interrupt-slice-ms
-  "How long one read waits for the socket to become readable before checking
-  whether its thread has been interrupted.
-
-  jolt's Thread.interrupt sets the flag and nothing more: a thread inside a
-  blocking syscall is not signalled, so a `recv` parked on a silent peer ran
-  its whole SO_RCVTIMEO after an interrupt (measured: 4.5 s of a 5 s timeout,
-  and a 5 s `poll` likewise). So `recv-bytes` waits for readability in slices
-  of this length and checks the flag between them, throwing
-  InterruptedException — the same exception an interrupted sleep throws — so
-  a caller that cancels a request gets its thread back within one slice
-  instead of one socket timeout. The socket's read timeout stays the bound
-  on the read as a whole; this only decides how promptly a cancel lands."
-  250)
-
 (defn- read-timeout-ms
   "The socket's SO_RCVTIMEO in milliseconds, 0 when none is set (or the query
   fails, which reads as unbounded rather than as a timeout that never was)."
@@ -295,30 +314,9 @@
   timeout has elapsed with nothing to read."
   [fd]
   (let [timeout  (read-timeout-ms fd)
-        deadline (when (pos? timeout) (+ (System/currentTimeMillis) timeout))
-        pf       (ffi/alloc 8)]
-    (try
-      ;; struct pollfd, as in timed-connect: events at offset 4, revents zeroed
-      ;; at 6.
-      (dotimes [i 8] (ffi/write pf :uint8 0 i))
-      (ffi/write pf :int fd 0)
-      (ffi/write pf :uint16 po-pollin 4)
-      (loop []
-        (when (Thread/interrupted)
-          (conn-ex "java.lang.InterruptedException" "read interrupted"))
-        (let [now   (System/currentTimeMillis)
-              slice (if deadline
-                      (min interrupt-slice-ms (max 0 (- deadline now)))
-                      interrupt-slice-ms)
-              pr    (c-poll pf 1 (int slice))]
-          (cond
-            (pos? pr) nil
-            (and deadline (>= (System/currentTimeMillis) deadline))
-            (conn-ex "java.net.SocketTimeoutException" "Read timed out")
-            (zero? pr) (recur)
-            (= (poller/errno) eintr) (recur)
-            :else (conn-ex "java.io.IOException" "poll failed"))))
-      (finally (ffi/free pf)))))
+        deadline (when (pos? timeout) (+ (System/currentTimeMillis) timeout))]
+    (when (= :timeout (await-ready! fd po-pollin deadline "read"))
+      (conn-ex "java.net.SocketTimeoutException" "Read timed out"))))
 
 (defn- recv-err-ex
   "The exception a negative recv deserves, classed by what actually failed:
@@ -375,22 +373,34 @@
       (finally (ffi/free pf)))))
 
 (defn send-bytes
-  "Send all of byte-array `data` over `fd`."
+  "Send all of byte-array `data` over `fd`.
+
+  The fd is temporarily non-blocking so a full peer receive window becomes a
+  sliced POLLOUT wait that observes interruption. Blocking mode is restored only
+  after the complete byte array is sent; every failure leaves the uncertain
+  stream for its request owner to close without masking the primary throwable."
   [fd data]
   (let [n (alength data)
         buf (ffi/alloc (max 1 n))]
     (try
+      (check-interrupted! "write")
       (ffi/write-array buf data)
-      (loop [off 0]
-        (when (< off n)
-          (let [sent (c-send fd (+ buf off) (- n off) 0)
-                err (when (neg? sent) (poller/errno))]
-            (cond
-              (pos? sent) (recur (+ off sent))
-              (= err eintr) (recur off)
-              (= err econnreset) (conn-ex "java.net.SocketException" "Connection reset")
-              (= err epipe) (conn-ex "java.net.SocketException" "Broken pipe")
-              :else (conn-ex "java.io.IOException" (str "send failed (errno " err ")"))))))
+      (when (pos? n)
+        (set-nonblock! fd true)
+        (loop [off 0]
+          (when (< off n)
+            (check-interrupted! "write")
+            (let [sent (c-send fd (+ buf off) (- n off) 0)
+                  err (when (neg? sent) (poller/errno))]
+              (cond
+                (pos? sent) (recur (+ off sent))
+                (= err eintr) (recur off)
+                (= err eagain) (do (await-ready! fd po-pollout nil "write")
+                                   (recur off))
+                (= err econnreset) (conn-ex "java.net.SocketException" "Connection reset")
+                (= err epipe) (conn-ex "java.net.SocketException" "Broken pipe")
+                :else (conn-ex "java.io.IOException" (str "send failed (errno " err ")"))))))
+        (set-nonblock! fd false))
       (finally (ffi/free buf)))))
 
 (defn close [fd] (c-close fd) nil)

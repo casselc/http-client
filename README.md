@@ -52,9 +52,12 @@ HTTP framing, timeout and cancellation behavior otherwise comes from v0.0.10,
 while strict TLS EOF handling is retained: only `close_notify` is a clean TLS
 EOF. A fully framed response returns without observing a later raw FIN, but an
 incomplete or close-delimited response rejects that FIN as TLS truncation.
-In particular, a thread interrupted during a blocked response read returns
-within the documented 250 ms poll slice instead of waiting for the complete
-socket timeout. The minimum supported runtime remains Jolt 0.8.1.
+In particular, a thread interrupted during a blocked connect, request write, or
+response read returns within the documented 250 ms poll slice instead of
+waiting for the kernel connect window, a full peer receive buffer, or the
+complete socket timeout. DNS resolution itself is still a blocking system call,
+and cancelling the emulated `CompletableFuture` does not propagate an interrupt
+to its worker. The minimum supported runtime remains Jolt 0.8.1.
 
 ## Client options
 
@@ -105,9 +108,12 @@ against 1184 ms without.
 
 A peer can retire a pooled connection between requests and nothing can rule that
 out in advance. Two things cover it: a socket the peer has already closed is
-detected and dropped before it is used, and a reused connection that answers with
-no bytes at all is retried once on a fresh one — a peer that never sent a byte
-never acted on the request, so even a `POST` is safe to retry there.
+detected and dropped before it is used, and an idempotent request on a reused
+connection that receives no response bytes may be retried once on a fresh one.
+`POST` and other non-idempotent requests are never replayed, because a peer may
+act on a request and close before returning its first response byte. An
+interrupted write is also never replayed, whatever the method, because an
+arbitrary prefix may already be on the wire.
 
 The knobs live in `jolt.http.core`, and apply process-wide:
 
@@ -134,7 +140,11 @@ you pass them.
 `:conn-timeout` bounds each connect attempt, the way `java.net.Socket`'s does —
 a name resolving to a dead address and a live one still connects, and the dead
 one costs at most the timeout instead of the kernel's SYN retry window (~75s on
-macOS, ~130s on Linux). `:socket-timeout` bounds each individual read.
+macOS, ~130s on Linux). With no connect timeout the deadline remains unbounded,
+but readiness is still checked in 250 ms slices so interruption is prompt.
+`:socket-timeout` bounds each individual read. Writes have no independent
+timeout, but a full peer receive window is likewise waited in interruptible
+250 ms readiness slices.
 
 Neither bounds a peer that keeps trickling bytes: every read beats the read
 timeout, so the response never ends. `(jolt.http.platform/set-max-response-ms!

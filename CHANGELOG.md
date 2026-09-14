@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Make TCP connect, plaintext writes, and TLS ciphertext writes observe thread
+  interruption within the same bounded 250 ms readiness slice already used by
+  response reads. Every connect attempt is temporarily non-blocking even when
+  no connect timeout was configured; partial writes resume from the exact
+  unsent suffix after `EAGAIN`/`POLLOUT`. Interrupted or otherwise failed
+  streams remain owned by the active request, are closed once, and are never
+  replayed. DNS resolution and `CompletableFuture.cancel` propagation remain
+  outside this transport-level change.
+
 - Converge the request-aspect fork with `jolt-lang/http-client` v0.0.10. The
   resulting provider retains the single `clj-http.lite.core/request` join point
   while adopting upstream's interruptible 250 ms read slices, response framing

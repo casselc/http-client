@@ -86,9 +86,7 @@
                  (let [received (atom false)]
                    (try (once (core/set-stream-timeout! pooled (tget conn :read-timeout)) received)
                         (catch Throwable t
-                          (if (and (core/idempotent-method? method)
-                                   (not @received)
-                                   (core/connection-gone? t))
+                          (if (core/retryable-stale-failure? method @received t)
                             (once (open!) (atom false))
                             (throw t)))))
                  (once (open!) (atom false)))
